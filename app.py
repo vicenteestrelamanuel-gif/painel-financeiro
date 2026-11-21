@@ -79,7 +79,7 @@ def positions(group):
         price, cur = quote(S["ymap"].get(p["Ativo"], p["Ativo"]))
         live = price is not None
         if not live: price, cur = S["px"].get(p["Ativo"], l["price"]), l["cur"]
-        rate = (fx_live(cur) if live else None) or S["fx"].get(cur) or l["fx"]
+        rate = S.get("fxman", {}).get(cur) or (fx_live(cur) if live else None) or S["fx"].get(cur) or l["fx"]
         val = p["Qtd"] * price * rate
         out.append({"Ativo": p["Ativo"], "Pie": p["Pie"] if group == "pie" else ", ".join(sorted(p["pies"])), "Moeda": cur, "Qtd": p["Qtd"],
             "Preço": price, "Custo €": p["Custo"], "Valor €": val, "L/P €": val - p["Custo"], "L/P %": (val / p["Custo"] - 1) * 100 if p["Custo"] else 0,
@@ -279,13 +279,36 @@ with t2:
             if allp != "—": imp["Pie"] = allp
             ed = st.data_editor(imp, hide_index=True, key=f"imp{allp}", disabled=[c for c in imp.columns if c not in ("Importar", "Pie")],
                 column_config={"Pie": st.column_config.SelectboxColumn(options=S["pies"])})
-            sel = ed[ed["Importar"]]
+            sel = ed[ed["Importar"]]; dups = ed[ed["Duplicada"]]
+            upd = st.checkbox("Atualizar câmbio e preço das transações já existentes com os valores reais do CSV (corrige câmbios estimados)", True)
+            n_up = len(dups) if upd else 0
             if sel["Pie"].isna().any(): st.warning("Falta escolher a pie em algumas linhas.")
-            elif st.button(f"Importar {len(sel)} transações", type="primary") and len(sel):
+            elif (len(sel) or n_up) and st.button(f"Importar {len(sel)} novas" + (f" e atualizar {n_up} existentes" if n_up else ""), type="primary"):
                 for _, r in sel.iterrows():
                     S["tx"].append(dict(id=uuid.uuid4().hex[:8], date=r["Data"], tk=r["Ativo"], pie=r["Pie"], type=r["Tipo"], qty=r["Qtd"], price=r["Preço"], cur=r["Moeda"], fx=r["Câmbio €"], bid=r["ID"]))
                     S["fx"].setdefault(r["Moeda"], r["Câmbio €"])
-                save(); st.success("Importado."); st.rerun()
+                if upd:
+                    for _, r in dups.iterrows():
+                        t = next((t for t in S["tx"] if t.get("bid") == r["ID"] or (t["tk"] == r["Ativo"] and t["date"] == r["Data"] and abs(t["qty"] - r["Qtd"]) < 1e-6)), None)
+                        if t: t.update(fx=r["Câmbio €"], price=r["Preço"], cur=r["Moeda"], bid=r["ID"])
+                save(); st.success("Concluído."); st.rerun()
+    with st.expander("💱 Câmbio da corretora (acertar o valor com a conta)"):
+        S.setdefault("fxman", {}); curs = sorted({t["cur"] for t in S["tx"]} - {"EUR"})
+        st.caption("O valor das posições em moeda estrangeira usa o câmbio ao vivo do Yahoo, que difere um pouco do da corretora. Aqui podes fixar o câmbio da corretora.")
+        for cur in curs:
+            c = st.columns(3); live = fx_live(cur); c[0].metric(f"{cur}→€ ao vivo (Yahoo)", f"{live:.5f}" if live else "—")
+            man = c[1].number_input(f"Câmbio manual {cur}→€ (0 = ao vivo)", min_value=0.0, value=float(S["fxman"].get(cur) or 0), format="%.6f", key=f"man_{cur}")
+            if c[2].button("Guardar", key=f"sman_{cur}"):
+                (S["fxman"].__setitem__(cur, man) if man > 0 else S["fxman"].pop(cur, None)); save(); st.rerun()
+        if curs:
+            st.markdown("**Calibrar com o valor da conta**")
+            a = st.columns(3); cp = a[0].selectbox("Pie", S["pies"], key="cal_pie"); cc = a[1].selectbox("Moeda", curs, key="cal_cur"); acct = a[2].number_input("Valor da pie na corretora (€)", min_value=0.0, format="%.2f", key="cal_val")
+            if st.button("Calcular e guardar como câmbio manual"):
+                pdf = positions("pie"); sub = pdf[pdf["Pie"] == cp] if not pdf.empty else pdf
+                nat = float((sub[sub["Moeda"] == cc]["Qtd"] * sub[sub["Moeda"] == cc]["Preço"]).sum()) if len(sub) else 0
+                other = float(sub[sub["Moeda"] != cc]["Valor €"].sum()) if len(sub) else 0
+                if nat > 0 and acct > other: S["fxman"][cc] = (acct - other) / nat; save(); st.success(f"Câmbio {cc}→€ fixado em {S['fxman'][cc]:.6f}"); st.rerun()
+                else: st.warning("Não há posições nessa moeda nessa pie, ou o valor indicado é demasiado baixo.")
     with st.expander("⚙️ Pies e símbolos do Yahoo"):
         n = st.text_input("Nova pie")
         if st.button("Criar pie") and n and n not in S["pies"]: S["pies"].append(n); save(); st.rerun()
