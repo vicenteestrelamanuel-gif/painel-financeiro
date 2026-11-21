@@ -65,13 +65,13 @@ def positions(group):
     m, last = {}, {}
     for t in sorted(S["tx"], key=lambda t: t["date"]):
         last[t["tk"]] = t
-        p = m.setdefault((t["pie"] if group == "pie" else "—", t["tk"]), dict(Pie=t["pie"] if group == "pie" else "—", Ativo=t["tk"], Qtd=0.0, Custo=0.0, pies=set()))
+        p = m.setdefault((t["pie"] if group == "pie" else "—", t["tk"]), dict(Pie=t["pie"] if group == "pie" else "—", Ativo=t["tk"], Qtd=0.0, Custo=0.0, CN=0.0, pies=set()))
         p["pies"].add(t["pie"])
         if t["type"] == "Compra":
-            p["Qtd"] += t["qty"]; p["Custo"] += t["qty"] * t["price"] * t["fx"]
+            p["Qtd"] += t["qty"]; p["Custo"] += t["qty"] * t["price"] * t["fx"]; p["CN"] += t["qty"] * t["price"]
         else:
             f = min(1, t["qty"] / p["Qtd"]) if p["Qtd"] > 0 else 0
-            p["Custo"] -= p["Custo"] * f; p["Qtd"] -= t["qty"]
+            p["Custo"] -= p["Custo"] * f; p["CN"] -= p["CN"] * f; p["Qtd"] -= t["qty"]
     out = []
     for p in m.values():
         if p["Qtd"] <= 1e-9: continue
@@ -81,8 +81,11 @@ def positions(group):
         if not live: price, cur = S["px"].get(p["Ativo"], l["price"]), l["cur"]
         rate = S.get("fxman", {}).get(cur) or (fx_live(cur) if live else None) or S["fx"].get(cur) or l["fx"]
         val = p["Qtd"] * price * rate
+        # L/P = efeito do preço (a câmbio de compra) + efeito do câmbio (sobre o valor atual na moeda local)
+        if cur == l["cur"] and p["CN"] > 0: fb = p["Custo"] / p["CN"]; vn = p["Qtd"] * price; e_px, e_fx = (vn - p["CN"]) * fb, vn * (rate - fb)
+        else: e_px = e_fx = np.nan
         out.append({"Ativo": p["Ativo"], "Pie": p["Pie"] if group == "pie" else ", ".join(sorted(p["pies"])), "Moeda": cur, "Qtd": p["Qtd"],
-            "Preço": price, "Custo €": p["Custo"], "Valor €": val, "L/P €": val - p["Custo"], "L/P %": (val / p["Custo"] - 1) * 100 if p["Custo"] else 0,
+            "Preço": price, "Custo €": p["Custo"], "Valor €": val, "L/P €": val - p["Custo"], "L/P %": (val / p["Custo"] - 1) * 100 if p["Custo"] else 0, "L/P preço €": e_px, "Efeito câmbio €": e_fx,
             "Fonte": "ao vivo" if live else "último preço"})
     df = pd.DataFrame(out)
     if not df.empty: df["Peso %"] = df["Valor €"] / df["Valor €"].sum() * 100
@@ -235,11 +238,12 @@ with t1:
         V, C = df["Valor €"].sum(), df["Custo €"].sum()
         k = st.columns(4); k[0].metric("Valor atual", f"{V:,.2f} €"); k[1].metric("Investido", f"{C:,.2f} €")
         k[2].metric("Lucro/Prejuízo", f"{V-C:,.2f} €"); k[3].metric("Rentabilidade", f"{(V/C-1)*100 if C else 0:+.2f} %")
+        st.caption(f"Efeito do câmbio no lucro/prejuízo: {df['Efeito câmbio €'].sum():+,.2f} €  ·  efeito do preço: {df['L/P preço €'].sum():+,.2f} €  (L/P € = preço + câmbio; “—” = ativo cotado noutra moeda no Yahoo)")
         a, b = st.columns(2)
         a.plotly_chart(px.pie(df.groupby("Pie")["Valor €"].sum().reset_index(), names="Pie", values="Valor €", hole=.5, title="Por pie"), width="stretch")
         b.plotly_chart(px.bar(df.head(15), x="Ativo", y="L/P €", color="L/P €", color_continuous_scale="RdYlGn", title="Lucro/Prejuízo por posição"), width="stretch")
         df = df.reset_index(drop=True)
-        ev = st.dataframe(df.style.format({"Qtd": "{:.4f}", "Preço": "{:.2f}", "Custo €": "{:.2f}", "Valor €": "{:.2f}", "L/P €": "{:+.2f}", "L/P %": "{:+.2f}", "Peso %": "{:.1f}"}),
+        ev = st.dataframe(df.style.format({"Qtd": "{:.4f}", "Preço": "{:.2f}", "Custo €": "{:.2f}", "Valor €": "{:.2f}", "L/P €": "{:+.2f}", "L/P %": "{:+.2f}", "L/P preço €": "{:+.2f}", "Efeito câmbio €": "{:+.2f}", "Peso %": "{:.1f}"}, na_rep="—"),
             hide_index=True, width="stretch", on_select="rerun", selection_mode="single-row", key="pos_tbl")
         rows = ev.selection.rows
         if rows:
