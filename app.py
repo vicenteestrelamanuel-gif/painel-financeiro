@@ -87,6 +87,46 @@ def positions(group):
     if not df.empty: df["Peso %"] = df["Valor €"] / df["Valor €"].sum() * 100
     return df.sort_values("Valor €", ascending=False) if not df.empty else df
 
+@st.cache_data(ttl=3600)
+def hist(sym, start):
+    try:
+        tk = yf.Ticker(sym); cur = tk.fast_info["currency"]
+        h = tk.history(start=start, auto_adjust=False)["Close"]
+        if h.empty: return None, None
+        h.index = h.index.tz_localize(None).normalize(); h = h[~h.index.duplicated()]
+        return (h / 100, "GBP") if cur == "GBp" else (h, cur)
+    except Exception:
+        return None, None
+
+def timeline(txs):
+    """Valor investido (custo acumulado) e valor atual (qtd x preço de fecho x câmbio) por dia útil."""
+    days = pd.bdate_range(min(t["date"] for t in txs), dt.date.today())
+    inv = pd.Series(0.0, index=days); val = inv.copy(); groups = {}
+    for t in sorted(txs, key=lambda t: t["date"]): groups.setdefault((t["pie"], t["tk"]), []).append(t)
+    for (pie, tk), L in groups.items():
+        q = c = 0.0; ev = {}
+        for t in L:
+            if t["type"] == "Compra": q += t["qty"]; c += t["qty"] * t["price"] * t["fx"]
+            else:
+                f = min(1, t["qty"] / q) if q > 0 else 0; c -= c * f; q -= t["qty"]
+            ev[pd.Timestamp(t["date"])] = (q, c)
+        s = pd.DataFrame(ev, index=["q", "c"]).T
+        s = s.reindex(s.index.union(days)).ffill().reindex(days).fillna(0)
+        p, cur = hist(S["ymap"].get(tk, tk), L[0]["date"])
+        if p is None or p.empty:  # sem histórico: usa os preços das compras
+            cur = L[-1]["cur"]; p = pd.Series({pd.Timestamp(t["date"]): t["price"] for t in L}); p = p[~p.index.duplicated(keep="last")]
+        p = p.reindex(p.index.union(days)).ffill().bfill().reindex(days)
+        if cur == "EUR": r = 1.0
+        else:
+            fh, _ = hist(f"{cur}EUR=X", L[0]["date"])
+            r = fh.reindex(fh.index.union(days)).ffill().bfill().reindex(days) if fh is not None and not fh.empty else (S["fx"].get(cur) or L[-1]["fx"])
+        inv += s["c"]; val += s["q"] * p * r
+    return pd.DataFrame({"Valor investido": inv, "Valor atual": val})
+
+def show_tl(txs, title, key):
+    tl = timeline(txs)
+    st.plotly_chart(px.line(tl, title=title).update_layout(yaxis_title="€", xaxis_title=None, legend_title=None), width="stretch", key=key)
+
 def parse_csv(f):
     d = pd.read_csv(f); d = d[d["Action"].str.contains("buy|sell", case=False, na=False)]; rows = []
     for _, x in d.iterrows():
@@ -121,6 +161,15 @@ with t1:
         b.plotly_chart(px.bar(df.head(15), x="Ativo", y="L/P €", color="L/P €", color_continuous_scale="RdYlGn", title="Lucro/Prejuízo por posição"), width="stretch")
         st.dataframe(df.style.format({"Qtd": "{:.4f}", "Preço": "{:.2f}", "Custo €": "{:.2f}", "Valor €": "{:.2f}", "L/P €": "{:+.2f}", "L/P %": "{:+.2f}", "Peso %": "{:.1f}"}), hide_index=True, width="stretch")
         st.caption("“ao vivo” = cotação do Yahoo Finance (atualiza de 15 em 15 min); “último preço” = não encontrei o símbolo, uso o último preço de compra. Corrige os símbolos em Transações.")
+        st.subheader("Evolução: valor atual vs valor investido")
+        base = [t for t in S["tx"] if pie_f == "Todas" or t["pie"] == pie_f]
+        tks = sorted({t["tk"] for t in base})
+        sel = st.selectbox("Ativo", ["Geral (todas as posições)"] + tks)
+        show_tl(base if sel.startswith("Geral") else [t for t in base if t["tk"] == sel], "Geral" if sel.startswith("Geral") else sel, "tl_sel")
+        if st.checkbox("Mostrar um gráfico por ativo (mais lento)"):
+            cols = st.columns(3)
+            for i, tk in enumerate(tks):
+                with cols[i % 3]: show_tl([t for t in base if t["tk"] == tk], tk, f"tl_{tk}")
 
 # ================= TRANSAÇÕES =================
 with t2:
