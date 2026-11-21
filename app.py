@@ -296,6 +296,14 @@ with t2:
                         t = next((t for t in S["tx"] if t.get("bid") == r["ID"] or (t["tk"] == r["Ativo"] and t["date"] == r["Data"] and abs(t["qty"] - r["Qtd"]) < 1e-6)), None)
                         if t: t.update(fx=r["Câmbio €"], price=r["Preço"], cur=r["Moeda"], bid=r["ID"])
                 save(); st.success("Concluído."); st.rerun()
+    with st.expander("💾 Backup e restauro de dados"):
+        st.download_button("⬇️ Exportar backup (JSON)", json.dumps(S, ensure_ascii=False), file_name=f"backup_{dt.date.today()}.json", mime="application/json")
+        up = st.file_uploader("Carregar ficheiro de dados (JSON)", type="json", key="restore")
+        if up:
+            new = json.load(up); parts = [k for k in ("tx", "pies", "fx", "ymap", "g", "r", "cats", "inc") if k in new]
+            st.info(f"O ficheiro substitui: {', '.join(parts)} (o resto fica como está). Transações: {len(S['tx'])} atuais → {len(new.get('tx', S['tx']))} no ficheiro.")
+            if st.checkbox("Já exportei um backup dos dados atuais") and st.button("Substituir dados", type="primary"):
+                S.update({k: new[k] for k in parts}); save(); st.success("Dados substituídos."); st.rerun()
     with st.expander("💱 Câmbio da corretora (acertar o valor com a conta)"):
         S.setdefault("fxman", {}); curs = sorted({t["cur"] for t in S["tx"]} - {"EUR"})
         st.caption("O valor das posições em moeda estrangeira usa o câmbio ao vivo do Yahoo, que difere um pouco do da corretora. Aqui podes fixar o câmbio da corretora.")
