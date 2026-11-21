@@ -1,5 +1,6 @@
 import json, os, re, uuid, datetime as dt
-import pandas as pd, plotly.express as px, requests, streamlit as st, yfinance as yf
+import numpy as np, pandas as pd, plotly.express as px, plotly.graph_objects as go, requests, streamlit as st, yfinance as yf
+from plotly.subplots import make_subplots
 
 st.set_page_config(page_title="Painel Financeiro", page_icon="📈", layout="wide")
 MES = ["Janeiro","Fevereiro","Março","Abril","Maio","Junho","Julho","Agosto","Setembro","Outubro","Novembro","Dezembro"]
@@ -127,6 +128,84 @@ def show_tl(txs, title, key):
     tl = timeline(txs)
     st.plotly_chart(px.line(tl, title=title).update_layout(yaxis_title="€", xaxis_title=None, legend_title=None), width="stretch", key=key)
 
+@st.cache_data(ttl=3600)
+def hist_full(sym):
+    try:
+        tk = yf.Ticker(sym); cur = tk.fast_info["currency"]
+        h = tk.history(period="max", auto_adjust=False)
+        if h.empty: return None, None
+        h.index = h.index.tz_localize(None).normalize(); h = h[~h.index.duplicated()]
+        if cur == "GBp": h[["Open", "High", "Low", "Close"]] = h[["Open", "High", "Low", "Close"]] / 100; cur = "GBP"
+        return h, cur
+    except Exception:
+        return None, None
+
+@st.cache_data(ttl=3600)
+def info(sym):
+    try:
+        t = yf.Ticker(sym); i = dict(t.info or {})
+        dv = t.dividends
+        if len(dv):
+            dv.index = dv.index.tz_localize(None); i["div12m"] = float(dv[dv.index >= pd.Timestamp.today() - pd.Timedelta(days=365)].sum())
+        return i
+    except Exception:
+        return {}
+
+PER = {"1M": 30, "3M": 91, "6M": 182, "YTD": None, "1A": 365, "2A": 730, "5A": 1826, "Máx": 0}
+
+@st.dialog("Detalhe do ativo", width="large")
+def detail(tk):
+    sym = S["ymap"].get(tk, tk); txs = [t for t in S["tx"] if t["tk"] == tk]
+    st.subheader(f"{tk}  ·  {sym}")
+    per = st.radio("Período", list(PER), index=4, horizontal=True)
+    h, cur = hist_full(sym)
+    if h is None:
+        st.warning("Não encontrei histórico no Yahoo para este símbolo. Corrige-o em Transações → Pies e símbolos do Yahoo.")
+        st.dataframe(pd.DataFrame(txs).drop(columns=["id"], errors="ignore"), hide_index=True); return
+    today = pd.Timestamp(dt.date.today())
+    start = pd.Timestamp(today.year, 1, 1) if per == "YTD" else (h.index[0] if PER[per] == 0 else today - pd.Timedelta(days=PER[per]))
+    d = h[h.index >= start]
+    if len(d) < 3: st.warning("Poucos dados neste período."); return
+    c = d["Close"]; r = c.pct_change().dropna(); dd = c / c.cummax() - 1; i = info(sym)
+    t_stats, t_graf, t_prev, t_dados = st.tabs(["Estatísticas", "Gráficos", "Previsão", "Dados"])
+    with t_stats:
+        k = st.columns(4); k[0].metric(f"Preço ({cur})", f"{c.iloc[-1]:,.2f}"); k[1].metric(f"Retorno ({per})", f"{(c.iloc[-1]/c.iloc[0]-1)*100:+.2f} %")
+        k[2].metric("Máximo / Mínimo", f"{c.max():,.2f} / {c.min():,.2f}"); k[3].metric("Volatilidade anual", f"{r.std()*np.sqrt(252)*100:.1f} %")
+        k = st.columns(4); k[0].metric("Queda máx. (drawdown)", f"{dd.min()*100:.1f} %"); k[1].metric("MM50", f"{h['Close'].rolling(50).mean().iloc[-1]:,.2f}"); k[2].metric("MM200", f"{h['Close'].rolling(200).mean().iloc[-1]:,.2f}")
+        k[3].metric("Dividendos 12m", f"{i['div12m']:.2f} ({i['div12m']/c.iloc[-1]*100:.2f} %)" if i.get("div12m") else "—")
+        rows = {"Nome": i.get("longName"), "Setor": i.get("sector"), "Indústria": i.get("industry"), "Market cap": f"{i['marketCap']/1e9:,.1f} mil M" if i.get("marketCap") else None,
+            "P/E": i.get("trailingPE"), "P/E futuro": i.get("forwardPE"), "Alvo analistas (médio)": i.get("targetMeanPrice"), "Alvo mín. / máx.": f"{i.get('targetLowPrice')} / {i.get('targetHighPrice')}" if i.get("targetMeanPrice") else None,
+            "Recomendação": i.get("recommendationKey"), "Nº analistas": i.get("numberOfAnalystOpinions")}
+        rows = {a: str(b) for a, b in rows.items() if b not in (None, "")}
+        if rows: st.dataframe(pd.DataFrame({"Dado": rows.keys(), "Valor": rows.values()}), hide_index=True, width="stretch")
+        pdf = positions("pie"); pdf = pdf[pdf["Ativo"] == tk][["Pie", "Qtd", "Custo €", "Valor €", "L/P €", "L/P %"]] if not pdf.empty else pdf
+        if len(pdf): st.markdown("**A minha posição**"); st.dataframe(pdf.style.format({"Qtd": "{:.4f}", "Custo €": "{:.2f}", "Valor €": "{:.2f}", "L/P €": "{:+.2f}", "L/P %": "{:+.2f}"}), hide_index=True, width="stretch")
+    with t_graf:
+        a, b = st.columns(2); kind = a.radio("Tipo", ["Linha", "Candlestick"], horizontal=True); ma = b.checkbox("Médias móveis 50/200", True)
+        fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[.75, .25], vertical_spacing=.03)
+        if kind == "Linha": fig.add_trace(go.Scatter(x=d.index, y=c, name="Fecho", line=dict(color="#2f6df6")), 1, 1)
+        else: fig.add_trace(go.Candlestick(x=d.index, open=d["Open"], high=d["High"], low=d["Low"], close=c, name="Preço"), 1, 1)
+        if ma:
+            for n, col in ((50, "#e5a113"), (200, "#8e5bd9")): fig.add_trace(go.Scatter(x=d.index, y=h["Close"].rolling(n).mean()[d.index], name=f"MM{n}", line=dict(color=col, width=1)), 1, 1)
+        tb = [t for t in txs if t["type"] == "Compra" and t["cur"] == cur and pd.Timestamp(t["date"]) >= start]
+        if tb: fig.add_trace(go.Scatter(x=[t["date"] for t in tb], y=[t["price"] for t in tb], mode="markers", name="Minhas compras", marker=dict(size=9, color="#13935a", symbol="triangle-up")), 1, 1)
+        fig.add_trace(go.Bar(x=d.index, y=d["Volume"], name="Volume", marker_color="#7a8699"), 2, 1)
+        fig.update_layout(height=560, xaxis_rangeslider_visible=False, margin=dict(t=20), legend_orientation="h"); st.plotly_chart(fig, width="stretch")
+        st.plotly_chart(px.area(dd * 100, title="Queda desde o máximo (%)").update_layout(showlegend=False, yaxis_title="%", xaxis_title=None, height=260), width="stretch")
+    with t_prev:
+        hz = st.select_slider("Horizonte (dias)", [30, 60, 90, 180, 365], value=90); lr = np.log(c).diff().dropna(); mu, sg = lr.mean(), lr.std(); n = max(2, int(hz * 252 / 365))
+        paths = c.iloc[-1] * np.exp(np.cumsum((mu - .5 * sg ** 2) + sg * np.random.default_rng(1).normal(size=(2000, n)), axis=1)); q = np.percentile(paths, [10, 50, 90], axis=0)
+        fx_ = pd.bdate_range(c.index[-1] + pd.Timedelta(days=1), periods=n); hh = c.iloc[-min(len(c), 252):]
+        fig = go.Figure([go.Scatter(x=hh.index, y=hh, name="Histórico", line=dict(color="#2f6df6")), go.Scatter(x=fx_, y=q[2], line=dict(width=0), showlegend=False),
+            go.Scatter(x=fx_, y=q[0], fill="tonexty", fillcolor="rgba(120,120,120,.25)", line=dict(width=0), name="Intervalo 10–90%"), go.Scatter(x=fx_, y=q[1], name="Mediana", line=dict(dash="dash", color="#e5a113"))])
+        st.plotly_chart(fig.update_layout(height=420, margin=dict(t=20), legend_orientation="h"), width="stretch")
+        k = st.columns(4); k[0].metric("Mediana final", f"{q[1][-1]:,.2f} ({(q[1][-1]/c.iloc[-1]-1)*100:+.1f} %)"); k[1].metric("Cenário baixo (10%)", f"{q[0][-1]:,.2f}"); k[2].metric("Cenário alto (90%)", f"{q[2][-1]:,.2f}"); k[3].metric("Prob. de subir", f"{(paths[:, -1] > c.iloc[-1]).mean()*100:.0f} %")
+        if i.get("targetMeanPrice"): st.info(f"Preço-alvo médio dos analistas: {i['targetMeanPrice']:,.2f} {cur} ({(i['targetMeanPrice']/c.iloc[-1]-1)*100:+.1f} % face ao preço atual).")
+        st.caption("Simulação estatística (Monte Carlo) com a rentabilidade e volatilidade do período escolhido. Não é uma previsão fiável: não conhece notícias, resultados nem o mercado.")
+    with t_dados:
+        st.dataframe(d[["Open", "High", "Low", "Close", "Volume"]].sort_index(ascending=False).style.format("{:,.2f}", subset=["Open", "High", "Low", "Close"]), width="stretch", height=300)
+        if txs: st.markdown("**As minhas transações**"); st.dataframe(pd.DataFrame(txs).drop(columns=["id", "bid"], errors="ignore").sort_values("date", ascending=False), hide_index=True, width="stretch")
+
 def parse_csv(f):
     d = pd.read_csv(f); d = d[d["Action"].str.contains("buy|sell", case=False, na=False)]; rows = []
     for _, x in d.iterrows():
@@ -159,17 +238,27 @@ with t1:
         a, b = st.columns(2)
         a.plotly_chart(px.pie(df.groupby("Pie")["Valor €"].sum().reset_index(), names="Pie", values="Valor €", hole=.5, title="Por pie"), width="stretch")
         b.plotly_chart(px.bar(df.head(15), x="Ativo", y="L/P €", color="L/P €", color_continuous_scale="RdYlGn", title="Lucro/Prejuízo por posição"), width="stretch")
-        st.dataframe(df.style.format({"Qtd": "{:.4f}", "Preço": "{:.2f}", "Custo €": "{:.2f}", "Valor €": "{:.2f}", "L/P €": "{:+.2f}", "L/P %": "{:+.2f}", "Peso %": "{:.1f}"}), hide_index=True, width="stretch")
+        df = df.reset_index(drop=True)
+        ev = st.dataframe(df.style.format({"Qtd": "{:.4f}", "Preço": "{:.2f}", "Custo €": "{:.2f}", "Valor €": "{:.2f}", "L/P €": "{:+.2f}", "L/P %": "{:+.2f}", "Peso %": "{:.1f}"}),
+            hide_index=True, width="stretch", on_select="rerun", selection_mode="single-row", key="pos_tbl")
+        rows = ev.selection.rows
+        if rows:
+            tk_sel = df.iloc[rows[0]]["Ativo"]
+            if st.button(f"📊 Abrir detalhe de {tk_sel}") or st.session_state.get("opened") != tk_sel: st.session_state.opened = tk_sel; detail(tk_sel)
+        else: st.session_state.opened = None
+        st.caption("Clica numa linha para abrir o detalhe do ativo (estatísticas, gráficos, previsão e dados).")
         st.caption("“ao vivo” = cotação do Yahoo Finance (atualiza de 15 em 15 min); “último preço” = não encontrei o símbolo, uso o último preço de compra. Corrige os símbolos em Transações.")
         st.subheader("Evolução: valor atual vs valor investido")
-        base = [t for t in S["tx"] if pie_f == "Todas" or t["pie"] == pie_f]
-        tks = sorted({t["tk"] for t in base})
-        sel = st.selectbox("Ativo", ["Geral (todas as posições)"] + tks)
-        show_tl(base if sel.startswith("Geral") else [t for t in base if t["tk"] == sel], "Geral" if sel.startswith("Geral") else sel, "tl_sel")
-        if st.checkbox("Mostrar um gráfico por ativo (mais lento)"):
-            cols = st.columns(3)
-            for i, tk in enumerate(tks):
-                with cols[i % 3]: show_tl([t for t in base if t["tk"] == tk], tk, f"tl_{tk}")
+        show_tl(S["tx"], "Geral (todas as pies)", "tl_all")
+        pies_in = [p for p in S["pies"] if any(t["pie"] == p for t in S["tx"])]; cols = st.columns(2)
+        for i, p in enumerate(pies_in):
+            with cols[i % 2]: show_tl([t for t in S["tx"] if t["pie"] == p], p, f"tl_pie_{p}")
+        with st.expander("Por ativo"):
+            tks = sorted({t["tk"] for t in S["tx"]}); sel = st.selectbox("Ativo", tks); show_tl([t for t in S["tx"] if t["tk"] == sel], sel, "tl_sel")
+            if st.checkbox("Mostrar um gráfico por ativo (mais lento)"):
+                cols = st.columns(3)
+                for i, tk in enumerate(tks):
+                    with cols[i % 3]: show_tl([t for t in S["tx"] if t["tk"] == tk], tk, f"tl_{tk}")
 
 # ================= TRANSAÇÕES =================
 with t2:
