@@ -95,6 +95,10 @@ def fx_live(cur):
     if cur == "EUR": return 1.0
     return quote(f"{cur}EUR=X")[0]
 
+def rate_of(c, fb=1.0):
+    """Câmbio atual para €: manual (se definido) > Yahoo ao vivo > último guardado."""
+    return 1.0 if c == "EUR" else (S.get("fxman", {}).get(c) or fx_live(c) or S["fx"].get(c) or fb)
+
 def positions(group):
     m, last = {}, {}
     for t in sorted(S["tx"], key=lambda t: t["date"]):
@@ -102,10 +106,10 @@ def positions(group):
         p = m.setdefault((t["pie"] if group == "pie" else "—", t["tk"]), dict(Pie=t["pie"] if group == "pie" else "—", Ativo=t["tk"], Qtd=0.0, Custo=0.0, CN=0.0, pies=set()))
         p["pies"].add(t["pie"])
         if t["type"] == "Compra":
-            p["Qtd"] += t["qty"]; p["Custo"] += t["qty"] * t["price"] * t["fx"]; p["CN"] += t["qty"] * t["price"]
+            p["Qtd"] += t["qty"]; p["CN"] += t["qty"] * t["price"]
         else:
             f = min(1, t["qty"] / p["Qtd"]) if p["Qtd"] > 0 else 0
-            p["Custo"] -= p["Custo"] * f; p["CN"] -= p["CN"] * f; p["Qtd"] -= t["qty"]
+            p["CN"] -= p["CN"] * f; p["Qtd"] -= t["qty"]
     out = []
     for p in m.values():
         if p["Qtd"] <= 1e-9: continue
@@ -113,13 +117,9 @@ def positions(group):
         price, cur = quote(S["ymap"].get(p["Ativo"], p["Ativo"]))
         live = price is not None
         if not live: price, cur = S["px"].get(p["Ativo"], l["price"]), l["cur"]
-        rate = S.get("fxman", {}).get(cur) or (fx_live(cur) if live else None) or S["fx"].get(cur) or l["fx"]
-        val = p["Qtd"] * price * rate
-        # L/P = efeito do preço (a câmbio de compra) + efeito do câmbio (sobre o valor atual na moeda local)
-        if cur == l["cur"] and p["CN"] > 0: fb = p["Custo"] / p["CN"]; vn = p["Qtd"] * price; e_px, e_fx = (vn - p["CN"]) * fb, vn * (rate - fb)
-        else: e_px = e_fx = np.nan
+        val = p["Qtd"] * price * rate_of(cur, l["fx"]); custo = p["CN"] * rate_of(l["cur"], l["fx"])  # custo = qtd x preço de compra, convertido ao câmbio atual
         out.append({"Ativo": p["Ativo"], "Pie": p["Pie"] if group == "pie" else ", ".join(sorted(p["pies"])), "Moeda": cur, "Qtd": p["Qtd"],
-            "Preço": price, "Custo €": p["Custo"], "Valor €": val, "L/P €": val - p["Custo"], "L/P %": (val / p["Custo"] - 1) * 100 if p["Custo"] else 0, "L/P preço €": e_px, "Efeito câmbio €": e_fx,
+            "Preço": price, "Custo €": custo, "Valor €": val, "L/P €": val - custo, "L/P %": (val / custo - 1) * 100 if custo else 0,
             "Fonte": "ao vivo" if live else "último preço"})
     df = pd.DataFrame(out)
     if not df.empty: df["Peso %"] = df["Valor €"] / df["Valor €"].sum() * 100
@@ -137,14 +137,14 @@ def hist(sym, start):
         return None, None
 
 def timeline(txs):
-    """Valor investido (custo acumulado) e valor atual (qtd x preço de fecho x câmbio) por dia útil."""
+    """Valor investido (qtd x preço de compra) e valor atual (qtd x preço de fecho), ambos ao câmbio atual, por dia útil."""
     days = pd.bdate_range(min(t["date"] for t in txs), dt.date.today())
     inv = pd.Series(0.0, index=days); val = inv.copy(); groups = {}
     for t in sorted(txs, key=lambda t: t["date"]): groups.setdefault((t["pie"], t["tk"]), []).append(t)
     for (pie, tk), L in groups.items():
         q = c = 0.0; ev = {}
         for t in L:
-            if t["type"] == "Compra": q += t["qty"]; c += t["qty"] * t["price"] * t["fx"]
+            if t["type"] == "Compra": q += t["qty"]; c += t["qty"] * t["price"]
             else:
                 f = min(1, t["qty"] / q) if q > 0 else 0; c -= c * f; q -= t["qty"]
             ev[pd.Timestamp(t["date"])] = (q, c)
@@ -154,11 +154,8 @@ def timeline(txs):
         if p is None or p.empty:  # sem histórico: usa os preços das compras
             cur = L[-1]["cur"]; p = pd.Series({pd.Timestamp(t["date"]): t["price"] for t in L}); p = p[~p.index.duplicated(keep="last")]
         p = p.reindex(p.index.union(days)).ffill().bfill().reindex(days)
-        if cur == "EUR": r = 1.0
-        else:
-            fh, _ = hist(f"{cur}EUR=X", L[0]["date"])
-            r = fh.reindex(fh.index.union(days)).ffill().bfill().reindex(days) if fh is not None and not fh.empty else (S["fx"].get(cur) or L[-1]["fx"])
-        inv += s["c"]; val += s["q"] * p * r
+        r = rate_of(cur, L[-1]["fx"])
+        inv += s["c"] * rate_of(L[-1]["cur"], L[-1]["fx"]); val += s["q"] * p * r
     return pd.DataFrame({"Valor investido": inv, "Valor atual": val})
 
 def show_tl(txs, title, key, color="#6D5BF7"):
@@ -274,7 +271,7 @@ with t1:
     if not dfa.empty:
         VA, CA = dfa["Valor €"].sum(), dfa["Custo €"].sum(); LA = VA - CA
         st.markdown(f'<div class="hero"><small>Valor da carteira</small><div class="big">{num(VA)} €</div>{chip(LA, f"{num(LA, 2, True)} €  ·  {num(LA / CA * 100 if CA else 0, 2, True)} %")}'
-            f'<span class="chip nt">Investido {num(CA)} €</span>{chip(dfa["L/P preço €"].sum(), "Preço " + num(dfa["L/P preço €"].sum(), 2, True) + " €")}{chip(dfa["Efeito câmbio €"].sum(), "Câmbio " + num(dfa["Efeito câmbio €"].sum(), 2, True) + " €")}</div>', unsafe_allow_html=True)
+            f'<span class="chip nt">Investido {num(CA)} €</span></div>', unsafe_allow_html=True)
         gp = dfa.groupby("Pie").agg(v=("Valor €", "sum"), c=("Custo €", "sum")).sort_values("v", ascending=False)
         for i in range(0, len(gp), 4):
             cols = st.columns(4)
@@ -290,7 +287,6 @@ with t1:
         if pie_f != "Todas": df = df[df["Pie"] == pie_f]
         V, C = df["Valor €"].sum(), df["Custo €"].sum()
         if pie_f != "Todas": st.markdown(f'<span class="chip nt">{pie_f}</span>{chip(V - C, f"{num(V)} €  ·  {num(V - C, 2, True)} €  ·  {num((V / C - 1) * 100 if C else 0, 2, True)} %")}', unsafe_allow_html=True)
-        st.caption(f"Efeito do câmbio no lucro/prejuízo: {df['Efeito câmbio €'].sum():+,.2f} €  ·  efeito do preço: {df['L/P preço €'].sum():+,.2f} €  (L/P € = preço + câmbio; “—” = ativo cotado noutra moeda no Yahoo)")
         a, b = st.columns([1, 2]); g = df.groupby("Pie")["Valor €"].sum().reset_index()
         fig = px.pie(g, names="Pie", values="Valor €", hole=.62, color="Pie", color_discrete_map={p: pcol(p) for p in g["Pie"]}); fig.update_traces(textinfo="percent", marker_line_width=0)
         a.plotly_chart(fig.update_layout(title="Por pie", height=380, margin=dict(t=46, b=10, l=10, r=10), legend=dict(orientation="h"), paper_bgcolor="rgba(0,0,0,0)"), width="stretch")
@@ -299,8 +295,8 @@ with t1:
         fig.update_traces(texttemplate="<b>%{label}</b><br>%{color:+.1f}%", marker_line_width=2)
         b.plotly_chart(fig.update_layout(title="Mapa da carteira: tamanho = valor, cor = lucro/prejuízo", height=380, margin=dict(t=46, b=10, l=10, r=10), coloraxis_showscale=False, paper_bgcolor="rgba(0,0,0,0)"), width="stretch")
         df = df.reset_index(drop=True)
-        sty = df.style.format({"Qtd": "{:.4f}", "Preço": "{:.2f}", "Custo €": "{:.2f}", "Valor €": "{:.2f}", "L/P €": "{:+.2f}", "L/P %": "{:+.2f}", "L/P preço €": "{:+.2f}", "Efeito câmbio €": "{:+.2f}", "Peso %": "{:.1f}"}, na_rep="—")
-        sty = styler_map(styler_map(sty, pl_style, ["L/P €", "L/P %", "L/P preço €", "Efeito câmbio €"]), lambda p: f"color:{pcol(p)};font-weight:700", ["Pie"])
+        sty = df.style.format({"Qtd": "{:.4f}", "Preço": "{:.2f}", "Custo €": "{:.2f}", "Valor €": "{:.2f}", "L/P €": "{:+.2f}", "L/P %": "{:+.2f}", "Peso %": "{:.1f}"}, na_rep="—")
+        sty = styler_map(styler_map(sty, pl_style, ["L/P €", "L/P %"]), lambda p: f"color:{pcol(p)};font-weight:700", ["Pie"])
         ev = st.dataframe(sty, hide_index=True, width="stretch", on_select="rerun", selection_mode="single-row", key="pos_tbl",
             column_config={"Peso %": st.column_config.ProgressColumn("Peso", format="%.1f%%", min_value=0, max_value=float(max(df["Peso %"].max(), 1)))})
         rows = ev.selection.rows
@@ -330,7 +326,7 @@ with t2:
         b = st.columns(4); qty = b[0].number_input("Quantidade", min_value=0.0, format="%.8f"); pr = b[1].number_input("Preço por ação", min_value=0.0, format="%.4f")
         cur = b[2].selectbox("Moeda", sorted(set(["EUR", "USD", "GBP", "CHF", "CAD"]) | set(S["fx"]))); other = b[2].text_input("Outra moeda (código)").upper().strip(); cur = other or cur
         suggest = S["fx"].get(cur) or fx_live(cur) or 1.0
-        fxv = b[3].number_input("1 unidade = ? €", value=float(suggest), format="%.6f", key=f"fx_{cur}")
+        fxv = float(suggest)
         if st.button("Guardar transação", type="primary"):
             if tk and qty > 0 and pr > 0 and fxv > 0:
                 S["tx"].append(dict(id=uuid.uuid4().hex[:8], date=str(d), tk=tk, pie=pie, type=ty, qty=qty, price=pr, cur=cur, fx=fxv)); S["fx"].setdefault(cur, fxv); save(); st.rerun()
@@ -344,7 +340,7 @@ with t2:
             ed = st.data_editor(imp, hide_index=True, key=f"imp{allp}", disabled=[c for c in imp.columns if c not in ("Importar", "Pie")],
                 column_config={"Pie": st.column_config.SelectboxColumn(options=S["pies"])})
             sel = ed[ed["Importar"]]; dups = ed[ed["Duplicada"]]
-            upd = st.checkbox("Atualizar câmbio e preço das transações já existentes com os valores reais do CSV (corrige câmbios estimados)", True)
+            upd = False
             n_up = len(dups) if upd else 0
             if sel["Pie"].isna().any(): st.warning("Falta escolher a pie em algumas linhas.")
             elif (len(sel) or n_up) and st.button(f"Importar {len(sel)} novas" + (f" e atualizar {n_up} existentes" if n_up else ""), type="primary"):
@@ -364,23 +360,15 @@ with t2:
             st.info(f"O ficheiro substitui: {', '.join(parts)} (o resto fica como está). Transações: {len(S['tx'])} atuais → {len(new.get('tx', S['tx']))} no ficheiro.")
             if st.checkbox("Já exportei um backup dos dados atuais") and st.button("Substituir dados", type="primary"):
                 S.update({k: new[k] for k in parts}); save(); st.success("Dados substituídos."); st.rerun()
-    with st.expander("💱 Câmbio da corretora (acertar o valor com a conta)"):
+    with st.expander("💱 Câmbio de conversão para euros"):
         S.setdefault("fxman", {}); curs = sorted({t["cur"] for t in S["tx"]} - {"EUR"})
-        st.caption("O valor das posições em moeda estrangeira usa o câmbio ao vivo do Yahoo, que difere um pouco do da corretora. Aqui podes fixar o câmbio da corretora.")
+        st.caption("O custo (quantidade × preço de compra) e o valor atual são calculados na moeda da ação e convertidos para € ao câmbio atual. É o do Yahoo, ao vivo; aqui podes fixar outro.")
         for cur in curs:
             c = st.columns(3); live = fx_live(cur); c[0].metric(f"{cur}→€ ao vivo (Yahoo)", f"{live:.5f}" if live else "—")
             man = c[1].number_input(f"Câmbio manual {cur}→€ (0 = ao vivo)", min_value=0.0, value=float(S["fxman"].get(cur) or 0), format="%.6f", key=f"man_{cur}")
             if c[2].button("Guardar", key=f"sman_{cur}"):
                 (S["fxman"].__setitem__(cur, man) if man > 0 else S["fxman"].pop(cur, None)); save(); st.rerun()
-        if curs:
-            st.markdown("**Calibrar com o valor da conta**")
-            a = st.columns(3); cp = a[0].selectbox("Pie", S["pies"], key="cal_pie"); cc = a[1].selectbox("Moeda", curs, key="cal_cur"); acct = a[2].number_input("Valor da pie na corretora (€)", min_value=0.0, format="%.2f", key="cal_val")
-            if st.button("Calcular e guardar como câmbio manual"):
-                pdf = positions("pie"); sub = pdf[pdf["Pie"] == cp] if not pdf.empty else pdf
-                nat = float((sub[sub["Moeda"] == cc]["Qtd"] * sub[sub["Moeda"] == cc]["Preço"]).sum()) if len(sub) else 0
-                other = float(sub[sub["Moeda"] != cc]["Valor €"].sum()) if len(sub) else 0
-                if nat > 0 and acct > other: S["fxman"][cc] = (acct - other) / nat; save(); st.success(f"Câmbio {cc}→€ fixado em {S['fxman'][cc]:.6f}"); st.rerun()
-                else: st.warning("Não há posições nessa moeda nessa pie, ou o valor indicado é demasiado baixo.")
+
     with st.expander("⚙️ Pies e símbolos do Yahoo"):
         n = st.text_input("Nova pie")
         if st.button("Criar pie") and n and n not in S["pies"]: S["pies"].append(n); save(); st.rerun()
