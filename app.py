@@ -18,7 +18,8 @@ def pl_style(v): return "" if pd.isna(v) or v == 0 else f"color:{UP if v > 0 els
 def styler_map(sty, fn, subset): return (sty.map if hasattr(sty, "map") else sty.applymap)(fn, subset=subset)
 st.markdown("""<style>
 @import url('https://fonts.googleapis.com/css2?family=Manrope:wght@400;600;800&display=swap');
-html,body,.stApp,[class*="st-"]{font-family:'Manrope',system-ui,sans-serif}
+html,body,.stApp,.stApp p,.stApp label,.stApp button,.stApp input,.stApp textarea,.stApp li,.stApp h1,.stApp h2,.stApp h3,.stApp h4,[data-testid="stMarkdownContainer"]{font-family:'Manrope',system-ui,sans-serif}
+[data-testid="stIconMaterial"],.material-icons,.material-symbols-rounded{font-family:'Material Symbols Rounded','Material Icons'!important}
 .block-container{padding-top:1.1rem;max-width:1250px}
 .brand{font-weight:800;font-size:1.6rem;color:#14142B;letter-spacing:-.02em}
 .hero{background:#14142B;color:#fff;border-radius:22px;padding:22px 26px;margin:8px 0 14px}
@@ -79,6 +80,7 @@ if "S" not in st.session_state:
     except Exception as e:
         st.error(f"Não consegui ligar à base de dados: {e}"); st.stop()
 S = st.session_state.S
+S.setdefault("div", [])
 
 # ---------- cotações e câmbios (yfinance) ----------
 @st.cache_data(ttl=900)
@@ -244,6 +246,33 @@ def detail(tk):
         st.dataframe(d[["Open", "High", "Low", "Close", "Volume"]].sort_index(ascending=False).style.format("{:,.2f}", subset=["Open", "High", "Low", "Close"]), width="stretch", height=300)
         if txs: st.markdown("**As minhas transações**"); st.dataframe(pd.DataFrame(txs).drop(columns=["id", "bid"], errors="ignore").sort_values("date", ascending=False), hide_index=True, width="stretch")
 
+@st.cache_data(ttl=21600)
+def dps_hist(sym):
+    """Histórico de dividendos por ação (moeda de cotação) do Yahoo."""
+    try:
+        t = yf.Ticker(sym); dv = t.dividends; cur = t.fast_info["currency"]
+        if dv is None or dv.empty: return None, cur
+        dv.index = dv.index.tz_localize(None).normalize()
+        return (dv / 100, "GBP") if cur == "GBp" else (dv, cur)
+    except Exception:
+        return None, None
+
+def pie_of(tk, date):
+    q = {}
+    for t in S["tx"]:
+        if t["tk"] == tk and t["date"] <= date: q[t["pie"]] = q.get(t["pie"], 0) + (t["qty"] if t["type"] == "Compra" else -t["qty"])
+    if not q: q = {t["pie"]: 1 for t in S["tx"] if t["tk"] == tk}
+    return max(q, key=q.get) if q else None
+
+def parse_div(f):
+    d = pd.read_csv(f); d = d[d["Action"].str.contains("dividend", case=False, na=False)]; have = {x["id"] for x in S["div"]}; rows = []
+    for _, x in d.iterrows():
+        tk = x.get("Ticker")
+        if pd.isna(tk): continue
+        date = str(x["Time (UTC)"])[:10]
+        rows.append({"Importar": str(x["ID"]) not in have, "Pie": pie_of(tk, date), "Data": date, "Ativo": tk, "Valor": float(x["Total"]), "Moeda": x["Currency (Total)"], "ID": str(x["ID"]), "Duplicado": str(x["ID"]) in have})
+    return pd.DataFrame(rows)
+
 def parse_csv(f):
     d = pd.read_csv(f); d = d[d["Action"].str.contains("buy|sell", case=False, na=False)]; rows = []
     d["_ts"] = pd.to_datetime(d["Time (UTC)"], utc=True).astype("int64") / 1e9
@@ -263,7 +292,7 @@ def parse_csv(f):
 
 st.markdown('<div class="brand">📈 Painel Financeiro</div>', unsafe_allow_html=True)
 top = st.container()
-t1, t2, t3 = st.tabs(["Portfólio", "Transações", "Despesas"])
+t1, t_div, t2, t3 = st.tabs(["Portfólio", "Dividendos", "Transações", "Despesas"])
 
 # ================= PORTFÓLIO =================
 with t1:
@@ -356,7 +385,7 @@ with t2:
         st.download_button("⬇️ Exportar backup (JSON)", json.dumps(S, ensure_ascii=False), file_name=f"backup_{dt.date.today()}.json", mime="application/json")
         up = st.file_uploader("Carregar ficheiro de dados (JSON)", type="json", key="restore")
         if up:
-            new = json.load(up); parts = [k for k in ("tx", "pies", "fx", "ymap", "g", "r", "cats", "inc") if k in new]
+            new = json.load(up); parts = [k for k in ("tx", "pies", "fx", "ymap", "div", "g", "r", "cats", "inc") if k in new]
             st.info(f"O ficheiro substitui: {', '.join(parts)} (o resto fica como está). Transações: {len(S['tx'])} atuais → {len(new.get('tx', S['tx']))} no ficheiro.")
             if st.checkbox("Já exportei um backup dos dados atuais") and st.button("Substituir dados", type="primary"):
                 S.update({k: new[k] for k in parts}); save(); st.success("Dados substituídos."); st.rerun()
@@ -409,6 +438,63 @@ with t3:
         L.insert(0, "Apagar", False); e = st.data_editor(L, hide_index=True, key="e" + key, disabled=[c for c in L.columns if c != "Apagar"], width="stretch")
         if e["Apagar"].any() and st.button(f"Apagar {lab.lower()} selecionados"):
             S[key] = [x for x in S[key] if x["id"] not in set(e[e["Apagar"]]["id"])]; save(); st.rerun()
+
+with t_div:
+    dfa = positions("pie"); pies_d = [p for p in S["pies"] if not dfa.empty and p in set(dfa["Pie"])]
+    if dfa.empty: st.info("Sem posições abertas.")
+    else:
+        pick = st.pills("Pie", ["Todas"] + pies_d, default="Daily Dividend" if "Daily Dividend" in pies_d else "Todas", key="div_pie", label_visibility="collapsed") or "Todas"
+        sel = dfa if pick == "Todas" else dfa[dfa["Pie"] == pick]; col = "#6D5BF7" if pick == "Todas" else pcol(pick); today_ts = pd.Timestamp(dt.date.today())
+        rec = [x for x in S["div"] if pick == "Todas" or x["pie"] == pick]; recv = lambda x: x["amt"] * rate_of(x["cur"])
+        rows, cal = [], np.zeros(12)
+        with st.spinner("A ir buscar o histórico de dividendos (a primeira vez demora)..."):
+            for _, r in sel.iterrows():
+                dv, cur = dps_hist(S["ymap"].get(r["Ativo"], r["Ativo"])); rate = rate_of(cur or r["Moeda"])
+                l12 = dv[dv.index >= today_ts - pd.Timedelta(days=365)] if dv is not None else pd.Series(dtype=float)
+                inc = r["Qtd"] * float(l12.sum()) * rate
+                for d_, a_ in l12.items(): cal[d_.month - 1] += r["Qtd"] * a_ * rate
+                mine = [x for x in rec if x["tk"] == r["Ativo"]]
+                rows.append({"Ativo": r["Ativo"], "Pie": r["Pie"], "Qtd": r["Qtd"], "Div./ação 12m": float(l12.sum()), "Moeda": cur or r["Moeda"], "Pag./ano": len(l12), "Estimado €/ano": inc,
+                    "Yield s/ custo %": inc / r["Custo €"] * 100 if r["Custo €"] else 0, "Yield s/ valor %": inc / r["Valor €"] * 100 if r["Valor €"] else 0,
+                    "Recebido €": sum(recv(x) for x in mine), "Último pag.": max((x["date"] for x in mine), default=None)})
+        T = pd.DataFrame(rows).sort_values("Estimado €/ano", ascending=False); est = T["Estimado €/ano"].sum(); C, V = sel["Custo €"].sum(), sel["Valor €"].sum()
+        y12 = sum(recv(x) for x in rec if x["date"] >= str(dt.date.today() - dt.timedelta(days=365)))
+        k = st.columns(4)
+        k[0].markdown(card("Rendimento anual estimado", num(est) + " €", f'<span class="chip nt">≈ {num(est / 12)} € / mês</span>', col), unsafe_allow_html=True)
+        k[1].markdown(card("Yield sobre o custo", num(est / C * 100 if C else 0) + " %", f'<span class="chip nt">sobre o valor atual: {num(est / V * 100 if V else 0)} %</span>', col), unsafe_allow_html=True)
+        k[2].markdown(card("Recebido (total registado)", num(sum(recv(x) for x in rec)) + " €", f'<span class="chip nt">últimos 12 meses: {num(y12)} €</span>', UP), unsafe_allow_html=True)
+        k[3].markdown(card("Ativos que pagam", f"{int((T['Pag./ano'] > 0).sum())} de {len(T)}", f'<span class="chip nt">{int(T["Pag./ano"].sum())} pagamentos / ano</span>', "#F59E0B"), unsafe_allow_html=True)
+        a, b = st.columns(2); order = [(today_ts.month - 1 + i) % 12 for i in range(12)]
+        fig = px.bar(x=[MES[i][:3] for i in order], y=[cal[i] for i in order], title="Calendário estimado (próximos 12 meses, pelo que pagaram no último ano)")
+        a.plotly_chart(fig.update_traces(marker_color=col).update_layout(height=320, xaxis_title=None, yaxis_title="€", margin=dict(t=46, b=10), paper_bgcolor="rgba(0,0,0,0)"), width="stretch")
+        if rec:
+            R = pd.DataFrame([{"Mês": x["date"][:7], "Pie": x["pie"], "€": recv(x)} for x in rec]).groupby(["Mês", "Pie"], as_index=False)["€"].sum()
+            fig = px.bar(R, x="Mês", y="€", color="Pie", color_discrete_map={p: pcol(p) for p in R["Pie"].unique()}, title="Dividendos recebidos por mês")
+            b.plotly_chart(fig.update_layout(height=320, xaxis_title=None, margin=dict(t=46, b=10), paper_bgcolor="rgba(0,0,0,0)"), width="stretch")
+        else: b.info("Ainda não registaste dividendos recebidos. Importa o CSV de dividendos da Trading 212 ou regista à mão (em baixo).")
+        sty = T.style.format({"Qtd": "{:.4f}", "Div./ação 12m": "{:.3f}", "Estimado €/ano": "{:.2f}", "Yield s/ custo %": "{:.2f}", "Yield s/ valor %": "{:.2f}", "Recebido €": "{:.2f}"}, na_rep="—")
+        sty = styler_map(sty, lambda p: f"color:{pcol(p)};font-weight:700", ["Pie"])
+        st.dataframe(sty, hide_index=True, width="stretch", column_config={"Estimado €/ano": st.column_config.ProgressColumn("Estimado €/ano", format="%.2f", min_value=0, max_value=float(max(T["Estimado €/ano"].max(), 0.01)))})
+        st.caption("Estimativa = quantidade atual × dividendos pagos nos últimos 12 meses (Yahoo). Não garante pagamentos futuros; ativos sem histórico no Yahoo ficam a zero.")
+    with st.expander("➕ Registar ou importar dividendos"):
+        up = st.file_uploader("CSV de dividendos (Trading 212 → History → filtrar por Dividends → Export)", type="csv", key="divcsv")
+        if up:
+            nd = parse_div(up)
+            if nd.empty: st.warning("Não encontrei dividendos neste ficheiro.")
+            else:
+                ed = st.data_editor(nd, hide_index=True, key="div_ed", disabled=[c for c in nd.columns if c not in ("Importar", "Pie")], column_config={"Pie": st.column_config.SelectboxColumn(options=S["pies"])})
+                go_ = ed[ed["Importar"] & ed["Pie"].notna()]
+                if st.button(f"Importar {len(go_)} dividendos", type="primary") and len(go_):
+                    for _, r in go_.iterrows(): S["div"].append(dict(id=r["ID"], date=r["Data"], tk=r["Ativo"], pie=r["Pie"], amt=r["Valor"], cur=r["Moeda"]))
+                    save(); st.success("Importado."); st.rerun()
+        m = st.columns(5); mtk = m[1].selectbox("Ativo", sorted({t["tk"] for t in S["tx"]}), key="dm_tk"); mdt = m[0].date_input("Data", key="dm_dt")
+        pe = pie_of(mtk, str(mdt)); mp = m[2].selectbox("Pie", S["pies"], index=S["pies"].index(pe) if pe in S["pies"] else 0, key=f"dm_p_{mtk}")
+        mv = m[3].number_input("Valor recebido", min_value=0.0, step=0.01, format="%.2f", key="dm_v"); mc = m[4].selectbox("Moeda", ["EUR", "USD"], key="dm_c")
+        if st.button("Registar dividendo") and mv > 0: S["div"].append(dict(id=uuid.uuid4().hex[:8], date=str(mdt), tk=mtk, pie=mp, amt=mv, cur=mc)); save(); st.rerun()
+        if S["div"]:
+            L = pd.DataFrame(S["div"]).sort_values("date", ascending=False); L.insert(0, "Apagar", False)
+            e = st.data_editor(L, hide_index=True, key="div_list", disabled=[c for c in L.columns if c != "Apagar"], width="stretch")
+            if e["Apagar"].any() and st.button("Apagar dividendos selecionados"): S["div"] = [x for x in S["div"] if x["id"] not in set(e[e["Apagar"]]["id"])]; save(); st.rerun()
 
 with top:
     b1, b2, b3, _ = st.columns([1.2, 1.4, 1, 4])
