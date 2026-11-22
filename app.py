@@ -10,6 +10,7 @@ PIE_COL = {"Quantum": "#7C5CFF", "Alone Stocks": "#0FB5A6", "Daily Dividend": "#
 CAT_COL = {"Restaurantes": "#F97316", "Supermercado": "#84CC16", "Subscrições": "#A855F7", "Transportes": "#06B6D4", "Lazer": "#EC4899", "Saúde": "#EF4444", "Material Escolar": "#3B82F6", "Investido": "#F59E0B", "Outros": "#94A3B8"}
 EXTRA = ["#EC4899", "#84CC16", "#06B6D4", "#F97316", "#A855F7", "#64748B", "#EF4444"]
 UP, DN = "#12A150", "#E5484D"
+PALX = ["#7C5CFF", "#0FB5A6", "#F59E0B", "#3B82F6", "#EC4899", "#84CC16", "#06B6D4", "#F97316", "#A855F7", "#64748B"]
 pcol = lambda p: PIE_COL.get(p) or EXTRA[sum(map(ord, str(p))) % len(EXTRA)]
 def num(x, d=2, sign=False):
     return (f"{x:+,.{d}f}" if sign else f"{x:,.{d}f}").replace(",", " ").replace(".", ",")
@@ -163,13 +164,30 @@ def timeline(txs):
         inv += s["c"] * rate_of(L[-1]["cur"], L[-1]["fx"]); val += s["q"] * p * r
     return pd.DataFrame({"Valor investido": inv, "Valor atual": val})
 
-def show_tl(txs, title, key, color="#6D5BF7"):
-    tl = timeline(txs); win = tl["Valor atual"].iloc[-1] >= tl["Valor investido"].iloc[-1]
+def show_tl(txs, title, key, color="#6D5BF7", tl=None):
+    tl = tl if tl is not None else timeline(txs); win = tl["Valor atual"].iloc[-1] >= tl["Valor investido"].iloc[-1]
     fig = go.Figure([go.Scatter(x=tl.index, y=tl["Valor investido"], name="Investido", line=dict(color="#94A3B8", dash="dot", width=2)),
         go.Scatter(x=tl.index, y=tl["Valor atual"], name="Valor atual", line=dict(color=color, width=3), fill="tonexty", fillcolor="rgba(18,161,80,.16)" if win else "rgba(229,72,77,.16)")])
     fig.update_layout(title=dict(text=title, font=dict(size=15)), height=300, margin=dict(t=46, b=10, l=10, r=10), hovermode="x unified", plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
         legend=dict(orientation="h", y=1.14, x=1, xanchor="right"), yaxis=dict(gridcolor="#E7E5F0", ticksuffix=" €"), xaxis=dict(showgrid=False))
     st.plotly_chart(fig, width="stretch", key=key)
+
+_tlc = {}
+def tl_of(key, txs):
+    if key not in _tlc: _tlc[key] = timeline(txs)
+    return _tlc[key]
+
+def pie_stats(tl, txs):
+    """Retorno diário ponderado pelo tempo (tira as entradas e saídas de dinheiro) e estatísticas: dia, drawdown, melhor/pior dia, volatilidade."""
+    V = tl["Valor atual"]; fl = pd.Series(0.0, index=tl.index)
+    for t in txs:
+        p = tl.index.searchsorted(pd.Timestamp(t["date"]))
+        if p < len(tl.index): fl.iloc[p] += (1 if t["type"] == "Compra" else -1) * t["qty"] * t["price"] * rate_of(t["cur"], t["fx"])
+    prev = V.shift(1); r = ((V - fl) / prev - 1).where(prev > 1e-6).replace([np.inf, -np.inf], np.nan).dropna()
+    if len(r) < 2: return None
+    idx = (1 + r).cumprod(); dd = idx / idx.cummax() - 1
+    return dict(last=float(r.iloc[-1]) * 100, chg=float((V - prev - fl).iloc[-1]), mdd=float(dd.min()) * 100, cur_dd=float(dd.iloc[-1]) * 100,
+        best=(r.idxmax(), float(r.max()) * 100), worst=(r.idxmin(), float(r.min()) * 100), vol=float(r.std() * np.sqrt(252)) * 100)
 
 @st.cache_data(ttl=3600)
 def hist_full(sym):
@@ -430,9 +448,28 @@ with t1:
         if pie_f != "Todas": df = df[df["Pie"] == pie_f]
         V, C = df["Valor €"].sum(), df["Custo €"].sum()
         if pie_f != "Todas": st.markdown(f'<span class="chip nt">{pie_f}</span>{chip(V - C, f"{num(V)} €  ·  {num(V - C, 2, True)} €  ·  {num((V / C - 1) * 100 if C else 0, 2, True)} %")}', unsafe_allow_html=True)
-        a, b = st.columns([1, 2]); g = df.groupby("Pie")["Valor €"].sum().reset_index()
-        fig = px.pie(g, names="Pie", values="Valor €", hole=.62, color="Pie", color_discrete_map={p: pcol(p) for p in g["Pie"]}); fig.update_traces(textinfo="percent", marker_line_width=0)
-        a.plotly_chart(fig.update_layout(title="Por pie", height=380, margin=dict(t=46, b=10, l=10, r=10), legend=dict(orientation="h"), paper_bgcolor="rgba(0,0,0,0)"), width="stretch")
+        scope = [t for t in S["tx"] if (t["pie"] == pie_f if pie_f != "Todas" and grp.startswith("Sep") else t["pie"] in open_pies)]; col = pcol(pie_f) if pie_f != "Todas" else "#6D5BF7"
+        with st.spinner("A calcular estatísticas..."): ps = pie_stats(tl_of("sel:" + pie_f, scope), scope)
+        k = st.columns(4); dcol = lambda v: UP if v >= 0 else DN; big = df.iloc[0]
+        k[0].markdown(card("Valor atual", num(V) + " €", chip(V - C, f"{num(V - C, 2, True)} €  ·  {num((V / C - 1) * 100 if C else 0, 2, True)} %"), col), unsafe_allow_html=True)
+        k[1].markdown(card("Valor investido", num(C) + " €", f'<span class="chip nt">{len(df)} posições</span>', col), unsafe_allow_html=True)
+        if ps:
+            k[2].markdown(card("Variação do dia", num(ps["last"], 2, True) + " %", chip(ps["chg"], num(ps["chg"], 2, True) + " €"), dcol(ps["last"])), unsafe_allow_html=True)
+            k[3].markdown(card("Máx. drawdown", num(ps["mdd"], 2) + " %", f'<span class="chip nt">atual {num(ps["cur_dd"], 2)} %</span>', DN), unsafe_allow_html=True)
+            k = st.columns(4); dt_ = lambda d_: f'<span class="chip nt">{d_.day}/{d_.month}/{d_.year}</span>'
+            k[0].markdown(card("Melhor dia", num(ps["best"][1], 2, True) + " %", dt_(ps["best"][0]), UP), unsafe_allow_html=True)
+            k[1].markdown(card("Pior dia", num(ps["worst"][1], 2, True) + " %", dt_(ps["worst"][0]), DN), unsafe_allow_html=True)
+            k[2].markdown(card("Volatilidade anual", num(ps["vol"], 1) + " %", '<span class="chip nt">oscilação diária × √252</span>', col), unsafe_allow_html=True)
+            k[3].markdown(card("Maior posição", big["Ativo"], f'<span class="chip nt">{num(big["Valor €"] / V * 100 if V else 0, 1)} % da {"pie" if pie_f != "Todas" else "carteira"}</span>', col), unsafe_allow_html=True)
+        a, b = st.columns([1, 2])
+        if pie_f != "Todas" and grp.startswith("Sep"):
+            g = df.groupby("Ativo")["Valor €"].sum().sort_values(ascending=False)
+            if len(g) > 10: g = pd.concat([g.head(9), pd.Series({f"Outras ({len(g) - 9})": g.iloc[9:].sum()})])
+            fig = px.pie(pd.DataFrame({"Ativo": g.index, "Valor": g.values}), names="Ativo", values="Valor", hole=.62, color_discrete_sequence=PALX); ttl = f"Alocação por ação em {pie_f}"
+        else:
+            g = df.groupby("Pie")["Valor €"].sum().reset_index(); fig = px.pie(g, names="Pie", values="Valor €", hole=.62, color="Pie", color_discrete_map={p: pcol(p) for p in g["Pie"]}); ttl = "Alocação por pie"
+        fig.update_traces(textinfo="percent", marker_line_width=0)
+        a.plotly_chart(fig.update_layout(title=ttl, height=380, margin=dict(t=46, b=10, l=10, r=10), legend=dict(orientation="h"), paper_bgcolor="rgba(0,0,0,0)"), width="stretch")
         tm = df.assign(Carteira="Carteira"); path = ["Carteira", "Pie", "Ativo"] if grp.startswith("Sep") else ["Carteira", "Ativo"]
         fig = px.treemap(tm, path=path, values="Valor €", color="L/P %", color_continuous_scale=[[0, DN], [.5, "#F3F2FA"], [1, UP]], range_color=(-30, 30))
         fig.update_traces(texttemplate="<b>%{label}</b><br>%{color:+.1f}%", marker_line_width=2)
@@ -450,10 +487,10 @@ with t1:
         st.caption("Clica numa linha para abrir o detalhe do ativo (estatísticas, gráficos, previsão e dados).")
         st.caption("“ao vivo” = cotação do Yahoo Finance (atualiza de 15 em 15 min); “último preço” = não encontrei o símbolo, uso o último preço de compra. Corrige os símbolos em Transações.")
         st.subheader("Evolução: valor atual vs valor investido")
-        show_tl(S["tx"], "Geral (todas as pies)", "tl_all", "#14142B")
-        pies_in = [p for p in S["pies"] if any(t["pie"] == p for t in S["tx"])]; cols = st.columns(2)
+        cur_tx = [t for t in S["tx"] if t["pie"] in open_pies]; show_tl(cur_tx, "Geral (pies atuais)", "tl_all", "#14142B", tl_of("sel:Todas", cur_tx))
+        pies_in = open_pies; cols = st.columns(2)
         for i, p in enumerate(pies_in):
-            with cols[i % 2]: show_tl([t for t in S["tx"] if t["pie"] == p], p, f"tl_pie_{p}", pcol(p))
+            with cols[i % 2]: show_tl([t for t in S["tx"] if t["pie"] == p], p, f"tl_pie_{p}", pcol(p), tl_of("sel:" + p, [t for t in S["tx"] if t["pie"] == p]))
         with st.expander("Por ativo"):
             tks = sorted({t["tk"] for t in S["tx"]}); sel = st.selectbox("Ativo", tks); show_tl([t for t in S["tx"] if t["tk"] == sel], sel, "tl_sel")
             if st.checkbox("Mostrar um gráfico por ativo (mais lento)"):
@@ -543,7 +580,7 @@ with t3:
     k[2].markdown(card("Investido", num(inv_) + " €", color="#F59E0B"), unsafe_allow_html=True); k[3].markdown(card("Sobra p/ investir", num(rec - sob) + " €", color="#7C5CFF" if rec - sob >= 0 else DN), unsafe_allow_html=True)
     st.dataframe(styler_map(sm.set_index("Mês").style.format("{:.2f}"), pl_style, ["Sobra"]), width="stretch")
     c1, c2 = st.columns(2)
-    c1.plotly_chart(px.bar(sm.melt(id_vars="Mês", value_vars=["Receitas", "Total gastos"]), x="Mês", y="value", color="variable", barmode="group", title="Receitas vs gastos", color_discrete_map={"Receitas": UP, "Total gastos": DN}), width="stretch")
+    c1.plotly_chart(px.bar(sm.assign(Despesas=sm["Total gastos"] - sm["Investido"]).melt(id_vars="Mês", value_vars=["Despesas", "Investido"]), x="Mês", y="value", color="variable", barmode="group", title="Despesas vs valor investido por mês", color_discrete_map={"Despesas": DN, "Investido": "#F59E0B"}), width="stretch")
     mes = c2.selectbox("Mês", MES, index=dt.date.today().month - 1); mi = MES.index(mes); cat = sm.iloc[mi][S["cats"]]
     c2.plotly_chart(px.pie(cat[cat > 0].reset_index(name="v"), names="index", values="v", hole=.6, title=f"Gastos de {mes}", color="index", color_discrete_map=CAT_COL), width="stretch")
     for key, lab in (("g", "Gastos"), ("r", "Receitas")):
