@@ -3,6 +3,40 @@ import numpy as np, pandas as pd, plotly.express as px, plotly.graph_objects as 
 from plotly.subplots import make_subplots
 
 st.set_page_config(page_title="Painel Financeiro", page_icon="📈", layout="wide")
+PIE_COL = {"Quantum": "#7C5CFF", "Alone Stocks": "#0FB5A6", "Daily Dividend": "#F59E0B", "ETFs": "#3B82F6"}
+CAT_COL = {"Restaurantes": "#F97316", "Supermercado": "#84CC16", "Subscrições": "#A855F7", "Transportes": "#06B6D4", "Lazer": "#EC4899", "Saúde": "#EF4444", "Material Escolar": "#3B82F6", "Investido": "#F59E0B", "Outros": "#94A3B8"}
+EXTRA = ["#EC4899", "#84CC16", "#06B6D4", "#F97316", "#A855F7", "#64748B", "#EF4444"]
+UP, DN = "#12A150", "#E5484D"
+pcol = lambda p: PIE_COL.get(p) or EXTRA[sum(map(ord, str(p))) % len(EXTRA)]
+def num(x, d=2, sign=False):
+    return (f"{x:+,.{d}f}" if sign else f"{x:,.{d}f}").replace(",", " ").replace(".", ",")
+def chip(v, txt, kind=None): return f'<span class="chip {kind or ("up" if v >= 0 else "dn")}">{txt}</span>'
+def card(label, value, sub="", color="#7C5CFF", bar=None):
+    b = f'<div class="pbar"><i style="width:{max(2, min(100, bar)):.0f}%"></i></div>' if bar is not None else ""
+    return f'<div class="kc" style="--c:{color}"><div class="l">{label}</div><div class="v">{value}</div>{sub}{b}</div>'
+def pl_style(v): return "" if pd.isna(v) or v == 0 else f"color:{UP if v > 0 else DN};font-weight:700"
+def styler_map(sty, fn, subset): return (sty.map if hasattr(sty, "map") else sty.applymap)(fn, subset=subset)
+st.markdown("""<style>
+@import url('https://fonts.googleapis.com/css2?family=Manrope:wght@400;600;800&display=swap');
+html,body,.stApp,[class*="st-"]{font-family:'Manrope',system-ui,sans-serif}
+.block-container{padding-top:1.1rem;max-width:1250px}
+.brand{font-weight:800;font-size:1.6rem;color:#14142B;letter-spacing:-.02em}
+.hero{background:#14142B;color:#fff;border-radius:22px;padding:22px 26px;margin:8px 0 14px}
+.hero small{color:#A9A8C8;font-weight:600}.hero .big{font-size:2.7rem;font-weight:800;letter-spacing:-.025em;line-height:1.1;margin:2px 0 10px}
+.chip{display:inline-block;padding:3px 11px;border-radius:99px;font-weight:700;font-size:.82rem;margin:2px 6px 2px 0}
+.chip.up{background:#DDF5E7;color:#0B7A3B}.chip.dn{background:#FDE3E4;color:#B4232A}.chip.nt{background:#ECEBF7;color:#4A4980}
+.hero .chip.up{background:#16A34A33;color:#7BF0A5}.hero .chip.dn{background:#E5484D33;color:#FF9A9D}.hero .chip.nt{background:#ffffff1f;color:#E7E6FF}
+.kc{background:#fff;border-radius:16px;padding:14px 16px;border-left:6px solid var(--c);box-shadow:0 1px 4px rgba(20,20,43,.07);margin-bottom:8px}
+.kc .l{color:#6B6A8C;font-size:.82rem;font-weight:600}.kc .v{font-size:1.45rem;font-weight:800;color:#14142B;line-height:1.3}
+.pbar{height:6px;background:#ECEBF7;border-radius:9px;margin-top:9px;overflow:hidden}.pbar i{display:block;height:100%;background:var(--c);border-radius:9px}
+.stTabs [data-baseweb="tab-list"]{gap:6px}.stTabs [data-baseweb="tab"]{border-radius:99px;padding:6px 18px;background:#fff;height:auto}
+.stTabs [aria-selected="true"]{background:#14142B!important}.stTabs [aria-selected="true"] p{color:#fff!important}
+.stTabs [data-baseweb="tab-highlight"],.stTabs [data-baseweb="tab-border"]{display:none}
+div[data-testid="stMetric"]{background:#fff;border-radius:14px;padding:10px 14px;box-shadow:0 1px 4px rgba(20,20,43,.07)}
+div[data-testid="stExpander"]{background:#fff;border-radius:14px;border:0;box-shadow:0 1px 4px rgba(20,20,43,.07)}
+.stButton>button,.stDownloadButton>button{border-radius:12px;font-weight:700}
+</style>""", unsafe_allow_html=True)
+
 MES = ["Janeiro","Fevereiro","Março","Abril","Maio","Junho","Julho","Agosto","Setembro","Outubro","Novembro","Dezembro"]
 
 def has(k):
@@ -127,9 +161,13 @@ def timeline(txs):
         inv += s["c"]; val += s["q"] * p * r
     return pd.DataFrame({"Valor investido": inv, "Valor atual": val})
 
-def show_tl(txs, title, key):
-    tl = timeline(txs)
-    st.plotly_chart(px.line(tl, title=title).update_layout(yaxis_title="€", xaxis_title=None, legend_title=None), width="stretch", key=key)
+def show_tl(txs, title, key, color="#6D5BF7"):
+    tl = timeline(txs); win = tl["Valor atual"].iloc[-1] >= tl["Valor investido"].iloc[-1]
+    fig = go.Figure([go.Scatter(x=tl.index, y=tl["Valor investido"], name="Investido", line=dict(color="#94A3B8", dash="dot", width=2)),
+        go.Scatter(x=tl.index, y=tl["Valor atual"], name="Valor atual", line=dict(color=color, width=3), fill="tonexty", fillcolor="rgba(18,161,80,.16)" if win else "rgba(229,72,77,.16)")])
+    fig.update_layout(title=dict(text=title, font=dict(size=15)), height=300, margin=dict(t=46, b=10, l=10, r=10), hovermode="x unified", plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+        legend=dict(orientation="h", y=1.14, x=1, xanchor="right"), yaxis=dict(gridcolor="#E7E5F0", ticksuffix=" €"), xaxis=dict(showgrid=False))
+    st.plotly_chart(fig, width="stretch", key=key)
 
 @st.cache_data(ttl=3600)
 def hist_full(sym):
@@ -226,29 +264,45 @@ def parse_csv(f):
             "Preço": float(x["Price / share"]), "Moeda": cur, "Câmbio €": 1.0 if cur == "EUR" else (1 / ex if x["Currency (Total)"] == "EUR" else ref_fx(cur, x["_ts"])), "ID": x["ID"], "Duplicada": dup})
     return pd.DataFrame(rows)
 
-st.title("📈 Painel Financeiro")
+st.markdown('<div class="brand">📈 Painel Financeiro</div>', unsafe_allow_html=True)
+top = st.container()
 t1, t2, t3 = st.tabs(["Portfólio", "Transações", "Despesas"])
 
 # ================= PORTFÓLIO =================
 with t1:
-    c1, c2, c3 = st.columns([2, 2, 1])
-    grp = c1.selectbox("Vista", ["Separar por pie", "Agregar por ação"])
-    pie_f = c2.selectbox("Pie", ["Todas"] + S["pies"]) if grp.startswith("Sep") else "Todas"
-    if c3.button("🔄 Atualizar preços"): st.cache_data.clear(); st.rerun()
+    dfa = positions("pie")
+    if not dfa.empty:
+        VA, CA = dfa["Valor €"].sum(), dfa["Custo €"].sum(); LA = VA - CA
+        st.markdown(f'<div class="hero"><small>Valor da carteira</small><div class="big">{num(VA)} €</div>{chip(LA, f"{num(LA, 2, True)} €  ·  {num(LA / CA * 100 if CA else 0, 2, True)} %")}'
+            f'<span class="chip nt">Investido {num(CA)} €</span>{chip(dfa["L/P preço €"].sum(), "Preço " + num(dfa["L/P preço €"].sum(), 2, True) + " €")}{chip(dfa["Efeito câmbio €"].sum(), "Câmbio " + num(dfa["Efeito câmbio €"].sum(), 2, True) + " €")}</div>', unsafe_allow_html=True)
+        gp = dfa.groupby("Pie").agg(v=("Valor €", "sum"), c=("Custo €", "sum")).sort_values("v", ascending=False)
+        for i in range(0, len(gp), 4):
+            cols = st.columns(4)
+            for col, (p, r) in zip(cols, list(gp.iterrows())[i:i + 4]):
+                col.markdown(card(p, num(r.v) + " €", chip(r.v - r.c, f"{num(r.v - r.c, 2, True)} € · {num((r.v / r.c - 1) * 100 if r.c else 0, 1, True)} %"), pcol(p), r.v / VA * 100), unsafe_allow_html=True)
+    c1, c2 = st.columns([4, 1.5])
+    grp = c2.selectbox("Vista", ["Separar por pie", "Agregar por ação"], label_visibility="collapsed")
+    open_pies = [p for p in S["pies"] if not dfa.empty and p in set(dfa["Pie"])]
+    pie_f = (c1.pills("Pie", ["Todas"] + open_pies, default="Todas", label_visibility="collapsed") or "Todas") if grp.startswith("Sep") else "Todas"
     df = positions("pie" if grp.startswith("Sep") else "tk")
     if df.empty: st.info("Sem posições.")
     else:
         if pie_f != "Todas": df = df[df["Pie"] == pie_f]
         V, C = df["Valor €"].sum(), df["Custo €"].sum()
-        k = st.columns(4); k[0].metric("Valor atual", f"{V:,.2f} €"); k[1].metric("Investido", f"{C:,.2f} €")
-        k[2].metric("Lucro/Prejuízo", f"{V-C:,.2f} €"); k[3].metric("Rentabilidade", f"{(V/C-1)*100 if C else 0:+.2f} %")
+        if pie_f != "Todas": st.markdown(f'<span class="chip nt">{pie_f}</span>{chip(V - C, f"{num(V)} €  ·  {num(V - C, 2, True)} €  ·  {num((V / C - 1) * 100 if C else 0, 2, True)} %")}', unsafe_allow_html=True)
         st.caption(f"Efeito do câmbio no lucro/prejuízo: {df['Efeito câmbio €'].sum():+,.2f} €  ·  efeito do preço: {df['L/P preço €'].sum():+,.2f} €  (L/P € = preço + câmbio; “—” = ativo cotado noutra moeda no Yahoo)")
-        a, b = st.columns(2)
-        a.plotly_chart(px.pie(df.groupby("Pie")["Valor €"].sum().reset_index(), names="Pie", values="Valor €", hole=.5, title="Por pie"), width="stretch")
-        b.plotly_chart(px.bar(df.head(15), x="Ativo", y="L/P €", color="L/P €", color_continuous_scale="RdYlGn", title="Lucro/Prejuízo por posição"), width="stretch")
+        a, b = st.columns([1, 2]); g = df.groupby("Pie")["Valor €"].sum().reset_index()
+        fig = px.pie(g, names="Pie", values="Valor €", hole=.62, color="Pie", color_discrete_map={p: pcol(p) for p in g["Pie"]}); fig.update_traces(textinfo="percent", marker_line_width=0)
+        a.plotly_chart(fig.update_layout(title="Por pie", height=380, margin=dict(t=46, b=10, l=10, r=10), legend=dict(orientation="h"), paper_bgcolor="rgba(0,0,0,0)"), width="stretch")
+        tm = df.assign(Carteira="Carteira"); path = ["Carteira", "Pie", "Ativo"] if grp.startswith("Sep") else ["Carteira", "Ativo"]
+        fig = px.treemap(tm, path=path, values="Valor €", color="L/P %", color_continuous_scale=[[0, DN], [.5, "#F3F2FA"], [1, UP]], range_color=(-30, 30))
+        fig.update_traces(texttemplate="<b>%{label}</b><br>%{color:+.1f}%", marker_line_width=2)
+        b.plotly_chart(fig.update_layout(title="Mapa da carteira: tamanho = valor, cor = lucro/prejuízo", height=380, margin=dict(t=46, b=10, l=10, r=10), coloraxis_showscale=False, paper_bgcolor="rgba(0,0,0,0)"), width="stretch")
         df = df.reset_index(drop=True)
-        ev = st.dataframe(df.style.format({"Qtd": "{:.4f}", "Preço": "{:.2f}", "Custo €": "{:.2f}", "Valor €": "{:.2f}", "L/P €": "{:+.2f}", "L/P %": "{:+.2f}", "L/P preço €": "{:+.2f}", "Efeito câmbio €": "{:+.2f}", "Peso %": "{:.1f}"}, na_rep="—"),
-            hide_index=True, width="stretch", on_select="rerun", selection_mode="single-row", key="pos_tbl")
+        sty = df.style.format({"Qtd": "{:.4f}", "Preço": "{:.2f}", "Custo €": "{:.2f}", "Valor €": "{:.2f}", "L/P €": "{:+.2f}", "L/P %": "{:+.2f}", "L/P preço €": "{:+.2f}", "Efeito câmbio €": "{:+.2f}", "Peso %": "{:.1f}"}, na_rep="—")
+        sty = styler_map(styler_map(sty, pl_style, ["L/P €", "L/P %", "L/P preço €", "Efeito câmbio €"]), lambda p: f"color:{pcol(p)};font-weight:700", ["Pie"])
+        ev = st.dataframe(sty, hide_index=True, width="stretch", on_select="rerun", selection_mode="single-row", key="pos_tbl",
+            column_config={"Peso %": st.column_config.ProgressColumn("Peso", format="%.1f%%", min_value=0, max_value=float(max(df["Peso %"].max(), 1)))})
         rows = ev.selection.rows
         if rows:
             tk_sel = df.iloc[rows[0]]["Ativo"]
@@ -257,10 +311,10 @@ with t1:
         st.caption("Clica numa linha para abrir o detalhe do ativo (estatísticas, gráficos, previsão e dados).")
         st.caption("“ao vivo” = cotação do Yahoo Finance (atualiza de 15 em 15 min); “último preço” = não encontrei o símbolo, uso o último preço de compra. Corrige os símbolos em Transações.")
         st.subheader("Evolução: valor atual vs valor investido")
-        show_tl(S["tx"], "Geral (todas as pies)", "tl_all")
+        show_tl(S["tx"], "Geral (todas as pies)", "tl_all", "#14142B")
         pies_in = [p for p in S["pies"] if any(t["pie"] == p for t in S["tx"])]; cols = st.columns(2)
         for i, p in enumerate(pies_in):
-            with cols[i % 2]: show_tl([t for t in S["tx"] if t["pie"] == p], p, f"tl_pie_{p}")
+            with cols[i % 2]: show_tl([t for t in S["tx"] if t["pie"] == p], p, f"tl_pie_{p}", pcol(p))
         with st.expander("Por ativo"):
             tks = sorted({t["tk"] for t in S["tx"]}); sel = st.selectbox("Ativo", tks); show_tl([t for t in S["tx"] if t["tk"] == sel], sel, "tl_sel")
             if st.checkbox("Mostrar um gráfico por ativo (mais lento)"):
@@ -270,7 +324,8 @@ with t1:
 
 # ================= TRANSAÇÕES =================
 with t2:
-    with st.expander("➕ Nova transação (manual)"):
+    @st.dialog("➕ Nova transação", width="large")
+    def dlg_add():
         a = st.columns(4); d = a[0].date_input("Data"); tk = a[1].text_input("Ticker").upper().strip(); pie = a[2].selectbox("Pie ", S["pies"]); ty = a[3].selectbox("Tipo", ["Compra", "Venda"])
         b = st.columns(4); qty = b[0].number_input("Quantidade", min_value=0.0, format="%.8f"); pr = b[1].number_input("Preço por ação", min_value=0.0, format="%.4f")
         cur = b[2].selectbox("Moeda", sorted(set(["EUR", "USD", "GBP", "CHF", "CAD"]) | set(S["fx"]))); other = b[2].text_input("Outra moeda (código)").upper().strip(); cur = other or cur
@@ -280,7 +335,8 @@ with t2:
             if tk and qty > 0 and pr > 0 and fxv > 0:
                 S["tx"].append(dict(id=uuid.uuid4().hex[:8], date=str(d), tk=tk, pie=pie, type=ty, qty=qty, price=pr, cur=cur, fx=fxv)); S["fx"].setdefault(cur, fxv); save(); st.rerun()
             else: st.warning("Preenche ativo, quantidade, preço e câmbio.")
-    with st.expander("📥 Importar CSV (Trading 212)", expanded=True):
+    @st.dialog("📥 Importar CSV (Trading 212)", width="large")
+    def dlg_imp():
         f = st.file_uploader("Ficheiro CSV", type="csv")
         if f:
             imp = parse_csv(f); allp = st.selectbox("Pie para todas as linhas", ["—"] + S["pies"])
@@ -350,16 +406,24 @@ with t3:
         mk = f"{y}-{i:02d}"; g = [x for x in S["g"] if x["date"].startswith(mk)]; ri = sum(x["v"] for x in S["r"] if x["date"].startswith(mk))
         row = {"Mês": m, "Receitas": ri, **{c: sum(x["v"] for x in g if x["cat"] == c) for c in S["cats"]}}
         row["Total gastos"] = sum(x["v"] for x in g); row["Sobra"] = ri - row["Total gastos"]; rows.append(row)
-    sm = pd.DataFrame(rows); k = st.columns(3)
-    k[0].metric("Receitas", f"{sm['Receitas'].sum():,.2f} €"); k[1].metric("Gastos (sem investido)", f"{sm['Total gastos'].sum()-sm['Investido'].sum():,.2f} €"); k[2].metric("Sobra p/ investir", f"{sm['Sobra'].sum():,.2f} €")
-    st.dataframe(sm.set_index("Mês").style.format("{:.2f}"), width="stretch")
+    sm = pd.DataFrame(rows); rec, gas, inv_, sob = sm["Receitas"].sum(), sm["Total gastos"].sum() - sm["Investido"].sum(), sm["Investido"].sum(), sm["Total gastos"].sum()
+    k = st.columns(4)
+    k[0].markdown(card(f"Receitas {y}", num(rec) + " €", color=UP), unsafe_allow_html=True); k[1].markdown(card("Despesas (sem investido)", num(gas) + " €", color=DN), unsafe_allow_html=True)
+    k[2].markdown(card("Investido", num(inv_) + " €", color="#F59E0B"), unsafe_allow_html=True); k[3].markdown(card("Sobra p/ investir", num(rec - sob) + " €", color="#7C5CFF" if rec - sob >= 0 else DN), unsafe_allow_html=True)
+    st.dataframe(styler_map(sm.set_index("Mês").style.format("{:.2f}"), pl_style, ["Sobra"]), width="stretch")
     c1, c2 = st.columns(2)
-    c1.plotly_chart(px.bar(sm.melt(id_vars="Mês", value_vars=["Receitas", "Total gastos"]), x="Mês", y="value", color="variable", barmode="group", title="Receitas vs gastos"), width="stretch")
+    c1.plotly_chart(px.bar(sm.melt(id_vars="Mês", value_vars=["Receitas", "Total gastos"]), x="Mês", y="value", color="variable", barmode="group", title="Receitas vs gastos", color_discrete_map={"Receitas": UP, "Total gastos": DN}), width="stretch")
     mes = c2.selectbox("Mês", MES, index=dt.date.today().month - 1); mi = MES.index(mes); cat = sm.iloc[mi][S["cats"]]
-    c2.plotly_chart(px.pie(cat[cat > 0].reset_index(name="v"), names="index", values="v", hole=.5, title=f"Gastos de {mes}"), width="stretch")
+    c2.plotly_chart(px.pie(cat[cat > 0].reset_index(name="v"), names="index", values="v", hole=.6, title=f"Gastos de {mes}", color="index", color_discrete_map=CAT_COL), width="stretch")
     for key, lab in (("g", "Gastos"), ("r", "Receitas")):
         L = pd.DataFrame([x for x in S[key] if x["date"].startswith(f"{y}-{mi+1:02d}")]);
         if L.empty: continue
         L.insert(0, "Apagar", False); e = st.data_editor(L, hide_index=True, key="e" + key, disabled=[c for c in L.columns if c != "Apagar"], width="stretch")
         if e["Apagar"].any() and st.button(f"Apagar {lab.lower()} selecionados"):
             S[key] = [x for x in S[key] if x["id"] not in set(e[e["Apagar"]]["id"])]; save(); st.rerun()
+
+with top:
+    b1, b2, b3, _ = st.columns([1.2, 1.4, 1, 4])
+    if b1.button("➕ Transação", type="primary", width="stretch"): dlg_add()
+    if b2.button("📥 Importar CSV", width="stretch"): dlg_imp()
+    if b3.button("🔄 Preços", width="stretch"): st.cache_data.clear(); st.rerun()
