@@ -1,6 +1,9 @@
 import json, os, re, uuid, datetime as dt
 import numpy as np, pandas as pd, plotly.express as px, plotly.graph_objects as go, requests, streamlit as st, yfinance as yf
 from plotly.subplots import make_subplots
+from zoneinfo import ZoneInfo
+from itertools import groupby
+import concurrent.futures as cf
 
 st.set_page_config(page_title="Painel Financeiro", page_icon="📈", layout="wide")
 PIE_COL = {"Quantum": "#7C5CFF", "Alone Stocks": "#0FB5A6", "Daily Dividend": "#F59E0B", "ETFs": "#3B82F6"}
@@ -277,6 +280,58 @@ def parse_div(f):
         rows.append({"Importar": x["_id"] not in have, "Pie": pie_of(tk, x["_d"]), "Data": x["_d"], "Ativo": tk, "Valor": float(x["Total"]), "Moeda": x["Currency (Total)"], "ID": x["_id"], "Duplicado": x["_id"] in have})
     return pd.DataFrame(rows)
 
+# ---- calendário: datas oficiais (BLS, Fed, BCE) confirmadas até abril de 2027
+NY, CET = "America/New_York", "Europe/Berlin"
+TYPES = {
+ "FOMC": dict(tag="Fed · EUA", title="Decisão de juros da Fed (FOMC)", imp=3, color="#E5484D", kind="m",
+   desc="O comité da Fed decide a taxa de juro dos EUA e publica o comunicado. Logo a seguir (14h30 em Nova Iorque) o presidente da Fed faz a conferência de imprensa, que costuma mexer mais com os mercados do que a própria decisão.",
+   watch="Se a decisão e o tom surpreendem face ao esperado. Juros altos por mais tempo pesam em tecnológicas, quantum e REITs; sinais de cortes ajudam. O dólar também reage."),
+ "ATAS": dict(tag="Fed · EUA", title="Atas da última reunião da Fed", imp=2, color="#E5484D", kind="m",
+   desc="Publicadas três semanas depois da decisão. Mostram o debate interno: quantos membros defendiam subir, manter ou cortar os juros.",
+   watch="Sinais sobre a próxima decisão. Atas mais duras ou mais brandas do que o esperado mexem com as taxas de juro e com o dólar."),
+ "CPI": dict(tag="Inflação · EUA", title="Inflação nos EUA (CPI)", imp=3, color="#3B82F6", kind="m",
+   desc="Mede a variação dos preços ao consumidor no mês anterior. É o dado que mais influencia as expectativas para os juros da Fed.",
+   watch="A inflação 'core' (sem alimentos e energia) face ao esperado. Acima do esperado: juros mais altos por mais tempo e pressão nas ações de crescimento. Abaixo: alívio."),
+ "NFP": dict(tag="Emprego · EUA", title="Relatório de emprego dos EUA (NFP)", imp=3, color="#3B82F6", kind="m",
+   desc="Postos de trabalho criados, taxa de desemprego e salários do mês anterior. Mostra a força da economia americana.",
+   watch="Emprego muito forte pode adiar cortes de juros; muito fraco assusta com recessão. Os salários também contam para a inflação."),
+ "BCE": dict(tag="BCE · Zona euro", title="Decisão de juros do BCE", imp=3, color="#0FB5A6", kind="m",
+   desc="O Conselho do BCE decide as taxas de juro da zona euro (decisão às 14h15 CET, conferência de imprensa às 14h45).",
+   watch="Efeito no euro e nos ETFs europeus. Um euro mais forte reduz o valor em euros das tuas ações em dólares."),
+ "WITCH": dict(tag="Mercado", title="Expiração de opções e futuros (triple witching)", imp=1, color="#94A3B8", kind="x",
+   desc="Terceira sexta-feira de março, junho, setembro e dezembro: vencem opções e futuros sobre índices e ações.",
+   watch="Mais volume e movimentos bruscos perto do fecho. Normalmente não muda a tendência."),
+ "FERIADO": dict(tag="Feriado", title="Mercados fechados", imp=1, color="#94A3B8", kind="x", desc="Sem negociação nem cotações novas.", watch="Ordens feitas nesse dia só executam na abertura seguinte."),
+}
+MACRO = ([(d, "08:30", NY, "NFP") for d in ("2026-12-04", "2027-01-08", "2027-02-05", "2027-03-05", "2027-04-02")]
+  + [(d, "08:30", NY, "CPI") for d in ("2026-12-10", "2027-01-13", "2027-02-11", "2027-03-10", "2027-04-13")]
+  + [(d, "14:00", NY, "FOMC") for d in ("2026-12-09", "2027-01-27", "2027-03-17", "2027-04-28")]
+  + [(d, "14:00", NY, "ATAS") for d in ("2026-12-30", "2027-02-17", "2027-04-07", "2027-05-19")]
+  + [(d, "14:15", CET, "BCE") for d in ("2026-12-17", "2027-02-04", "2027-03-18", "2027-04-29")]
+  + [(d, None, None, "WITCH") for d in ("2026-12-18", "2027-03-19")]
+  + [(d, None, None, "FERIADO:" + n) for d, n in (("2026-12-25", "Natal (EUA e Europa)"), ("2027-01-01", "Ano Novo (EUA e Europa)"), ("2027-01-18", "Martin Luther King (só EUA)"), ("2027-02-15", "Presidents Day (só EUA)"), ("2027-03-26", "Sexta-feira Santa (EUA e Europa)"))])
+WD = ["Segunda", "Terça", "Quarta", "Quinta", "Sexta", "Sábado", "Domingo"]
+
+def lisboa(d, hm, tz):
+    h, m = map(int, hm.split(":")); return dt.datetime(d.year, d.month, d.day, h, m, tzinfo=ZoneInfo(tz)).astimezone(ZoneInfo("Europe/Lisbon")).strftime("%H:%M")
+
+def _cal1(sym):
+    try:
+        c = yf.Ticker(sym).calendar; return c if isinstance(c, dict) else {}
+    except Exception:
+        return {}
+
+@st.cache_data(ttl=21600)
+def cal_all(syms):
+    with cf.ThreadPoolExecutor(8) as ex: return dict(zip(syms, ex.map(_cal1, syms)))
+
+def to_date(v):
+    try:
+        if v is None or pd.isna(v): return None
+        d = v if isinstance(v, dt.date) and not isinstance(v, dt.datetime) else pd.Timestamp(v).date()
+        return None if pd.isna(d) else d
+    except Exception: return None
+
 def parse_csv(f):
     d = pd.read_csv(f); d = d[d["Action"].str.contains("buy|sell", case=False, na=False)]; rows = []
     d["_ts"] = pd.to_datetime(d["Time (UTC)"], utc=True).astype("int64") / 1e9
@@ -296,7 +351,7 @@ def parse_csv(f):
 
 st.markdown('<div class="brand">📈 Painel Financeiro</div>', unsafe_allow_html=True)
 top = st.container()
-t1, t_div, t2, t3 = st.tabs(["Portfólio", "Dividendos", "Transações", "Despesas"])
+t1, t_div, t_cal, t2, t3 = st.tabs(["Portfólio", "Dividendos", "Calendário", "Transações", "Despesas"])
 
 # ================= PORTFÓLIO =================
 with t1:
@@ -499,6 +554,50 @@ with t_div:
             L = pd.DataFrame(S["div"]).sort_values("date", ascending=False); L.insert(0, "Apagar", False)
             e = st.data_editor(L, hide_index=True, key="div_list", disabled=[c for c in L.columns if c != "Apagar"], width="stretch")
             if e["Apagar"].any() and st.button("Apagar dividendos selecionados"): S["div"] = [x for x in S["div"] if x["id"] not in set(e[e["Apagar"]]["id"])]; save(); st.rerun()
+
+with t_cal:
+    today = dt.date.today(); dfa = positions("pie"); totv = dfa["Valor €"].sum() if not dfa.empty else 0
+    usd = dfa[dfa["Moeda"] == "USD"]["Valor €"].sum() / totv * 100 if totv else 0
+    f1, f2 = st.columns([3, 2]); KS = ["🏛️ Mercado e bancos centrais", "📊 Resultados", "💰 Dividendos", "🔕 Feriados e expirações"]
+    kinds = f1.pills("Tipo", KS, selection_mode="multi", default=KS, label_visibility="collapsed") or []
+    horiz = f2.select_slider("Horizonte", [7, 14, 30, 60, 90, 120, 160], value=30, format_func=lambda n: f"{n} dias"); end = today + dt.timedelta(days=horiz); ev = []
+    for d_, hm, tz, k in MACRO:
+        d_ = dt.date.fromisoformat(d_); name = None
+        if k.startswith("FERIADO:"): k, name = k.split(":", 1)
+        T = TYPES[k]
+        if not (today <= d_ <= end) or KS[0 if T["kind"] == "m" else 3] not in kinds: continue
+        ev.append(dict(date=d_, time=lisboa(d_, hm, tz) if hm else None, tag=T["tag"], title=name or T["title"], imp=T["imp"], color=T["color"], desc=T["desc"], watch=T["watch"],
+            extra=f"Tens {usd:.0f} % da carteira em dólares" if k in ("FOMC", "CPI", "NFP", "ATAS", "BCE") and usd else ""))
+    if (KS[1] in kinds or KS[2] in kinds) and not dfa.empty:
+        pos = dfa.groupby("Ativo").agg(q=("Qtd", "sum"), v=("Valor €", "sum")); sym = {t: S["ymap"].get(t, t) for t in pos.index}
+        with st.spinner("A ir buscar resultados e dividendos das tuas ações (a primeira vez demora)..."): cal = cal_all(tuple(sorted(set(sym.values()))))
+        for tk, r in pos.iterrows():
+            c = cal.get(sym[tk]) or {}; w = r.v / totv * 100
+            ds = [to_date(x) for x in (c.get("Earnings Date") or [])]; ds = [x for x in ds if x and today <= x <= end]
+            if ds and KS[1] in kinds:
+                eps, rev = c.get("Earnings Average"), c.get("Revenue Average")
+                est = (f" Estimativa dos analistas: lucro por ação {eps:.2f}" if eps == eps and eps is not None else "") + (f", receita {rev / 1e9:.2f} mil M." if rev == rev and rev else ".")
+                ev.append(dict(date=ds[0], time=None, tag=f"Resultados · {tk}", title=f"{tk} apresenta resultados", imp=3 if w >= 3 else 2 if w >= 1 else 1, color="#7C5CFF",
+                    desc="A empresa divulga lucros e receitas do trimestre e, muitas vezes, as previsões para os próximos." + est, watch="A surpresa face ao esperado e as previsões futuras: é aqui que as ações mais saltam (para cima ou para baixo), muitas vezes 5 % a 15 %.", extra=f"Pesa {w:.1f} % da tua carteira"))
+            xd = to_date(c.get("Ex-Dividend Date"))
+            if xd and today <= xd <= end and KS[2] in kinds:
+                dv, cur = dps_hist(sym[tk]); pay = to_date(c.get("Dividend Date")); last = float(dv.iloc[-1]) if dv is not None and len(dv) else 0
+                ev.append(dict(date=xd, time=None, tag=f"Dividendo · {tk}", title=f"{tk}: data ex-dividendo", imp=2 if r.v > 0 else 1, color="#F59E0B",
+                    desc="Quem tiver a ação antes desta data recebe o próximo dividendo" + (f", pago a {pay.day}/{pay.month}." if pay else ".") + " No dia a ação costuma descer um pouco, o valor do dividendo.",
+                    watch="Nada a fazer se já tens a ação. Comprar nesse dia já não dá direito a este dividendo.", extra=f"Estimativa para ti: {num(r.q * last * rate_of(cur or 'USD'))} €" if last else ""))
+    ev.sort(key=lambda e: (e["date"], -e["imp"], e["time"] or "")); w7 = [e for e in ev if e["date"] <= today + dt.timedelta(days=7)]
+    k = st.columns(3)
+    k[0].markdown(card("Próximo evento", ev[0]["title"] if ev else "—", f'<span class="chip nt">{ev[0]["date"].day}/{ev[0]["date"].month}</span>' if ev else "", "#6D5BF7"), unsafe_allow_html=True)
+    k[1].markdown(card("Próximos 7 dias", f"{len(w7)} eventos", f'<span class="chip dn">{sum(e["imp"] == 3 for e in w7)} de importância alta</span>', "#E5484D"), unsafe_allow_html=True)
+    k[2].markdown(card("Exposição ao dólar", f"{usd:.0f} %", '<span class="chip nt">Fed, inflação e emprego dos EUA mexem no valor em €</span>', "#3B82F6"), unsafe_allow_html=True)
+    if not ev: st.info("Sem eventos neste período com os filtros escolhidos.")
+    for d_, grp in groupby(ev, key=lambda e: e["date"]):
+        n = (d_ - today).days; st.markdown(f"#### {WD[d_.weekday()]}, {d_.day}/{d_.month}/{d_.year}  ·  " + ("hoje" if n == 0 else "amanhã" if n == 1 else f"em {n} dias"))
+        for e in grp:
+            st.markdown(f'<div class="kc" style="--c:{e["color"]}"><div class="l">{e["tag"]}' + (f' · {e["time"]} (Lisboa)' if e["time"] else "") + f'</div><div class="v" style="font-size:1.1rem">{e["title"]}</div>'
+                f'<div style="color:#3D3C5C;font-size:.92rem;margin-top:5px">{e["desc"]}</div><div style="color:#3D3C5C;font-size:.92rem;margin-top:4px"><b>O que observar:</b> {e["watch"]}</div>'
+                f'<div style="margin-top:6px"><span class="chip nt">Importância {"alta" if e["imp"] == 3 else "média" if e["imp"] == 2 else "baixa"}</span>' + (f'<span class="chip nt">{e["extra"]}</span>' if e["extra"] else "") + "</div></div>", unsafe_allow_html=True)
+    st.caption("Datas oficiais do BLS (inflação e emprego), da Fed e do BCE, confirmadas até abril de 2027; horas convertidas para Lisboa. Resultados e dividendos das tuas ações vêm do Yahoo e podem mudar. O calendário da Fed para 2027 foi revisto em novembro de 2026 (a reunião de outubro de 2027 não terá decisão de juros). Não é aconselhamento financeiro.")
 
 with top:
     b1, b2, b3, _ = st.columns([1.2, 1.4, 1, 4])
