@@ -265,12 +265,16 @@ def pie_of(tk, date):
     return max(q, key=q.get) if q else None
 
 def parse_div(f):
-    d = pd.read_csv(f); d = d[d["Action"].str.contains("dividend", case=False, na=False)]; have = {x["id"] for x in S["div"]}; rows = []
+    d = pd.read_csv(f); d = d[d["Action"].str.contains("dividend", case=False, na=False)].copy(); have = {x["id"] for x in S["div"]}; rows = []
+    d["_d"] = d["Time (UTC)"].astype(str).str[:10]
+    if "ID" in d.columns and d["ID"].notna().all(): d["_id"] = d["ID"].astype(str)
+    else:  # sem coluna ID (export de dividendos): id estável = data|ativo|ações|total|tipo|nº de repetição
+        k = d["_d"] + "|" + d["Ticker"].astype(str) + "|" + d["No. of shares"].astype(str) + "|" + d["Total"].astype(str) + "|" + d["Action"].astype(str)
+        d["_id"] = k + "|" + k.groupby(k).cumcount().astype(str)
     for _, x in d.iterrows():
         tk = x.get("Ticker")
         if pd.isna(tk): continue
-        date = str(x["Time (UTC)"])[:10]
-        rows.append({"Importar": str(x["ID"]) not in have, "Pie": pie_of(tk, date), "Data": date, "Ativo": tk, "Valor": float(x["Total"]), "Moeda": x["Currency (Total)"], "ID": str(x["ID"]), "Duplicado": str(x["ID"]) in have})
+        rows.append({"Importar": x["_id"] not in have, "Pie": pie_of(tk, x["_d"]), "Data": x["_d"], "Ativo": tk, "Valor": float(x["Total"]), "Moeda": x["Currency (Total)"], "ID": x["_id"], "Duplicado": x["_id"] in have})
     return pd.DataFrame(rows)
 
 def parse_csv(f):
