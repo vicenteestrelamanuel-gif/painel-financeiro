@@ -211,6 +211,10 @@ def detail(tk):
 
 def parse_csv(f):
     d = pd.read_csv(f); d = d[d["Action"].str.contains("buy|sell", case=False, na=False)]; rows = []
+    d["_ts"] = pd.to_datetime(d["Time (UTC)"], utc=True).astype("int64") / 1e9
+    def ref_fx(cur, ts):  # ordens pagas com saldo em moeda estrangeira (Total != EUR): usa o câmbio da ordem em € mais próxima no tempo
+        r = d[(d["Currency (Price / share)"] == cur) & (d["Currency (Total)"] == "EUR") & d["Exchange rate"].notna()]
+        return float(1 / r.iloc[(r["_ts"] - ts).abs().values.argmin()]["Exchange rate"]) if len(r) else float(S["fx"].get(cur) or 1.0)
     for _, x in d.iterrows():
         cur, ex = x["Currency (Price / share)"], x.get("Exchange rate")
         ex = 1.0 if pd.isna(ex) else float(ex)
@@ -219,7 +223,7 @@ def parse_csv(f):
         known = sorted({t["pie"] for t in S["tx"] if t["tk"] == tk})
         pie = known[0] if len(known) == 1 else ("ETFs" if not known and re.search("ishares|xetra|etf|vanguard|spdr", str(x["Name"]), re.I) else None)
         rows.append({"Importar": not dup, "Pie": pie, "Data": date, "Ativo": tk, "Tipo": "Venda" if "sell" in x["Action"].lower() else "Compra", "Qtd": qty,
-            "Preço": float(x["Price / share"]), "Moeda": cur, "Câmbio €": 1.0 if cur == "EUR" else 1 / ex, "ID": x["ID"], "Duplicada": dup})
+            "Preço": float(x["Price / share"]), "Moeda": cur, "Câmbio €": 1.0 if cur == "EUR" else (1 / ex if x["Currency (Total)"] == "EUR" else ref_fx(cur, x["_ts"])), "ID": x["ID"], "Duplicada": dup})
     return pd.DataFrame(rows)
 
 st.title("📈 Painel Financeiro")
