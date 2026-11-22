@@ -351,6 +351,42 @@ def to_date(v):
         return None if pd.isna(d) else d
     except Exception: return None
 
+MKT = [("S&P 500", "^GSPC"), ("Nasdaq", "^IXIC"), ("Dow Jones", "^DJI"), ("Euro Stoxx 50", "^STOXX50E"), ("DAX", "^GDAXI"), ("FTSE 100", "^FTSE"), ("Nikkei 225", "^N225"),
+       ("EUR/USD", "EURUSD=X"), ("Ouro", "GC=F"), ("Petróleo WTI", "CL=F"), ("VIX (medo)", "^VIX"), ("Yield 10 anos EUA", "^TNX")]
+
+@st.cache_data(ttl=900)
+def closes(syms):
+    try:
+        d = yf.download(list(syms), period="3mo", auto_adjust=False, progress=False, group_by="column", threads=True)["Close"]
+        if isinstance(d, pd.Series): d = d.to_frame(syms[0])
+        d.index = pd.to_datetime(d.index).tz_localize(None).normalize()
+        return d.ffill()
+    except Exception:
+        return pd.DataFrame()
+
+@st.cache_data(ttl=900)
+def headlines(sym, n=4):
+    out = []
+    try:
+        for it in (yf.Ticker(sym).news or [])[:n]:
+            c = it.get("content") or it; title = c.get("title")
+            if title: out.append((title, (c.get("canonicalUrl") or {}).get("url") or c.get("link") or "", (c.get("provider") or {}).get("displayName") or c.get("publisher") or "", str(c.get("pubDate") or "")[:10]))
+    except Exception:
+        pass
+    return out
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def ai_explain(prompt):
+    r = requests.post("https://api.anthropic.com/v1/messages", timeout=120, headers={"x-api-key": st.secrets["ANTHROPIC_API_KEY"], "anthropic-version": "2023-06-01", "content-type": "application/json"},
+        json={"model": st.secrets["ANTHROPIC_MODEL"] if has("ANTHROPIC_MODEL") else "claude-sonnet-5-5", "max_tokens": 1200, "tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": 4}], "messages": [{"role": "user", "content": prompt}]})
+    r.raise_for_status(); return "".join(b.get("text", "") for b in r.json()["content"] if b.get("type") == "text")
+
+def qty_before(d):
+    q = {}
+    for t in S["tx"]:
+        if t["date"] < str(d): q[(t["pie"], t["tk"])] = q.get((t["pie"], t["tk"]), 0) + (t["qty"] if t["type"] == "Compra" else -t["qty"])
+    return {k: v for k, v in q.items() if v > 1e-9}
+
 def parse_csv(f):
     d = pd.read_csv(f); d = d[d["Action"].str.contains("buy|sell", case=False, na=False)]; rows = []
     d["_ts"] = pd.to_datetime(d["Time (UTC)"], utc=True).astype("int64") / 1e9
@@ -370,7 +406,7 @@ def parse_csv(f):
 
 st.markdown('<div class="brand">📈 Painel Financeiro</div>', unsafe_allow_html=True)
 top = st.container()
-t1, t_div, t_cal, t2, t3 = st.tabs(["Portfólio", "Dividendos", "Calendário", "Transações", "Despesas"])
+t1, t_day, t_div, t_cal, t2, t3 = st.tabs(["Portfólio", "Resumo do dia", "Dividendos", "Calendário", "Transações", "Despesas"])
 
 # ================= PORTFÓLIO =================
 with t1:
@@ -516,6 +552,72 @@ with t3:
         L.insert(0, "Apagar", False); e = st.data_editor(L, hide_index=True, key="e" + key, disabled=[c for c in L.columns if c != "Apagar"], width="stretch")
         if e["Apagar"].any() and st.button(f"Apagar {lab.lower()} selecionados"):
             S[key] = [x for x in S[key] if x["id"] not in set(e[e["Apagar"]]["id"])]; save(); st.rerun()
+
+with t_day:
+    dfa = positions("pie")
+    if dfa.empty: st.info("Sem posições abertas.")
+    else:
+        sym_all = {tk: S["ymap"].get(tk, tk) for tk in set(S["tx"] and [t["tk"] for t in S["tx"]])}
+        with st.spinner("A ir buscar as cotações do dia..."): C = closes(tuple(sorted(set(sym_all.values()) | {m for _, m in MKT})))
+        if C.empty or len(C) < 3: st.warning("Não consegui obter as cotações do Yahoo agora. Tenta de novo dentro de uns minutos (🔄 Preços).")
+        else:
+            days = [d_ for d_ in C.index[C.notna().sum(axis=1) >= max(3, C.shape[1] // 3)]][-30:]
+            live = days[-1].date() == dt.date.today() and dt.datetime.now(ZoneInfo("Europe/Lisbon")).hour < 22
+            opts = [d_.date() for d_ in days[1:]][::-1]
+            dsel = st.selectbox("Dia", opts, index=1 if live and len(opts) > 1 else 0, format_func=lambda d_: f"{WD[d_.weekday()]}, {d_.day}/{d_.month}/{d_.year}" + (" (a decorrer)" if d_ == dt.date.today() and live else ""))
+            d1 = pd.Timestamp(dsel); d0 = days[days.index(d1) - 1]; cur_of = dict(zip(dfa["Ativo"], dfa["Moeda"])); rows = []
+            for (pie, tk), q in qty_before(dsel).items():
+                sy = sym_all.get(tk)
+                if sy not in C.columns: continue
+                c0, c1 = C.at[d0, sy], C.at[d1, sy]; sc = 0.01 if sy.endswith(".L") else 1.0
+                if c0 == c0 and c1 == c1 and c0 > 0: rr = rate_of(cur_of.get(tk, "EUR")); rows.append({"Ativo": tk, "Pie": pie, "Var %": (c1 / c0 - 1) * 100, "L/P dia €": q * (c1 - c0) * sc * rr, "Valor antes €": q * c0 * sc * rr})
+            D = pd.DataFrame(rows)
+            mk = {n: ((C.at[d1, m] / C.at[d0, m] - 1) * 100 if m in C.columns and C.at[d0, m] > 0 else np.nan, C.at[d1, m] if m in C.columns else np.nan) for n, m in MKT}
+            if D.empty: st.info("Sem dados para este dia.")
+            else:
+                P = D["L/P dia €"].sum(); V0 = D["Valor antes €"].sum(); pp = P / V0 * 100 if V0 else 0; T = D.groupby("Ativo").agg(pl=("L/P dia €", "sum"), v0=("Valor antes €", "sum")); T["pct"] = T["pl"] / T["v0"] * 100
+                best, worst = T["pct"].idxmax(), T["pct"].idxmin(); sp = mk["S&P 500"][0]; bm = f'<span class="chip nt">S&P 500 {num(sp, 2, True)} %</span>' if sp == sp else ""
+                st.markdown(f'<div class="hero"><small>A tua carteira em {dsel.day}/{dsel.month}</small><div class="big">{num(P, 2, True)} €</div>{chip(pp, num(pp, 2, True) + " %")}{bm}'
+                    + (f'<span class="chip {"up" if pp - sp >= 0 else "dn"}">{num(pp - sp, 2, True)} p.p. vs S&P 500</span>' if sp == sp else "") + "</div>", unsafe_allow_html=True)
+                a, b = st.columns(2)
+                a.markdown(card("Maior ganho do dia", f"{best}  {num(T.at[best, 'pct'], 2, True)} %", chip(T.at[best, "pl"], num(T.at[best, "pl"], 2, True) + " €"), UP), unsafe_allow_html=True)
+                b.markdown(card("Maior perda do dia", f"{worst}  {num(T.at[worst, 'pct'], 2, True)} %", chip(T.at[worst, "pl"], num(T.at[worst, "pl"], 2, True) + " €"), DN), unsafe_allow_html=True)
+                st.markdown("#### Mercado global")
+                for i in range(0, len(MKT), 4):
+                    for col, (n, m) in zip(st.columns(4), MKT[i:i + 4]):
+                        v, lvl = mk[n]; col.markdown(card(n, (num(v, 2, True) + " %") if v == v else "—", f'<span class="chip nt">{num(lvl, 2)}</span>' if lvl == lvl else "", UP if v == v and v >= 0 else DN), unsafe_allow_html=True)
+                idx = [mk[n][0] for n in ("S&P 500", "Nasdaq", "Dow Jones", "Euro Stoxx 50", "DAX", "FTSE 100", "Nikkei 225") if mk[n][0] == mk[n][0]]; avg = np.mean(idx) if idx else 0
+                tone = "um dia de ganhos generalizados" if avg > 0.4 else "um dia de perdas generalizadas" if avg < -0.4 else "um dia misto, sem direção clara"
+                up5, dn5 = T.sort_values("pl", ascending=False).head(3), T.sort_values("pl").head(3); g = lambda df_: ", ".join(f"{k} ({num(r.pct, 1, True)} %, {num(r.pl, 2, True)} €)" for k, r in df_.iterrows())
+                pie_d = D.groupby("Pie")["L/P dia €"].sum().sort_values(); narr = (f"**Mercado:** {tone}. S&P 500 {num(mk['S&P 500'][0], 2, True)} %, Nasdaq {num(mk['Nasdaq'][0], 2, True)} %, Euro Stoxx 50 {num(mk['Euro Stoxx 50'][0], 2, True)} %; "
+                    f"euro/dólar {num(mk['EUR/USD'][0], 2, True)} %, ouro {num(mk['Ouro'][0], 2, True)} %, petróleo {num(mk['Petróleo WTI'][0], 2, True)} %, VIX {num(mk['VIX (medo)'][0], 1, True)} %.\n\n"
+                    f"**Carteira:** {'subiu' if P >= 0 else 'caiu'} {num(abs(pp), 2)} % ({num(P, 2, True)} €). Mais contribuíram: {g(up5)}. Mais pesaram: {g(dn5)}. "
+                    f"Por pie, a que mais ganhou foi {pie_d.index[-1]} ({num(pie_d.iloc[-1], 2, True)} €) e a que mais perdeu foi {pie_d.index[0]} ({num(pie_d.iloc[0], 2, True)} €).")
+                st.markdown("#### O que aconteceu"); st.markdown(narr)
+                hl = {"Mercado": headlines("^GSPC", 5) + headlines("^STOXX50E", 3)}
+                for k_ in list(up5.index) + list(dn5.index): hl[k_] = headlines(sym_all.get(k_, k_), 3)
+                prompt = (f"Dia de mercado: {dsel}. Escreve em português de Portugal, em 6 a 10 frases, o que moveu os mercados globais nesse dia e porque é que a carteira de um investidor particular subiu ou caiu. "
+                    "Usa a pesquisa web para confirmar as causas (Fed, dados económicos, resultados de empresas, geopolítica, matérias-primas). Liga as causas às posições que mais mexeram. Se não souberes a causa, di-lo; não inventes; não dês aconselhamento financeiro.\n\n"
+                    f"{narr}\n\nManchetes encontradas:\n" + "\n".join(f"- [{k_}] {t_[0]} ({t_[2]})" for k_, v_ in hl.items() for t_ in v_))
+                if has("ANTHROPIC_API_KEY"):
+                    if st.button("🤖 Explicar o dia com IA (pesquisa as notícias)"):
+                        try:
+                            with st.spinner("A pesquisar e a escrever..."): st.session_state[f"ai_{dsel}"] = ai_explain(prompt)
+                        except Exception as e: st.error(f"Não consegui gerar a explicação: {str(e)[:160]}")
+                    if st.session_state.get(f"ai_{dsel}"): st.info(st.session_state[f"ai_{dsel}"])
+                else: st.caption("Para uma explicação escrita por IA com pesquisa de notícias, junta `ANTHROPIC_API_KEY` aos Secrets da app (tem custo por utilização). Sem isso, o resumo acima é gerado só pelos números.")
+                c1_, c2_ = st.columns(2); X = T.sort_values("pl"); X = pd.concat([X.head(8), X.tail(8)]).drop_duplicates().reset_index()
+                fig = px.bar(X, x="pl", y="Ativo", orientation="h", color=X["pl"] >= 0, color_discrete_map={True: UP, False: DN}, title="Contribuição por ação (€)")
+                c1_.plotly_chart(fig.update_layout(showlegend=False, height=420, xaxis_title=None, yaxis_title=None, margin=dict(t=46, b=10), paper_bgcolor="rgba(0,0,0,0)"), width="stretch")
+                fig = px.bar(pie_d.reset_index(), x="Pie", y="L/P dia €", color="Pie", color_discrete_map={p: pcol(p) for p in pie_d.index}, title="Contribuição por pie (€)")
+                c2_.plotly_chart(fig.update_layout(showlegend=False, height=420, xaxis_title=None, margin=dict(t=46, b=10), paper_bgcolor="rgba(0,0,0,0)"), width="stretch")
+                st.markdown("#### Notícias")
+                for k_, v_ in hl.items():
+                    for t_ in v_: st.markdown(f"- **{k_}** · [{t_[0]}]({t_[1]}) · {t_[2]} {t_[3]}" if t_[1] else f"- **{k_}** · {t_[0]} · {t_[2]}")
+                if not any(hl.values()): st.caption("O Yahoo não devolveu notícias agora.")
+                with st.expander("Todas as posições neste dia"):
+                    st.dataframe(styler_map(T.reset_index().rename(columns={"pl": "L/P €", "pct": "Var %", "v0": "Valor antes €"}).sort_values("L/P €", ascending=False).style.format({"L/P €": "{:+.2f}", "Var %": "{:+.2f}", "Valor antes €": "{:.2f}"}), pl_style, ["L/P €", "Var %"]), hide_index=True, width="stretch")
+                st.caption("A variação usa as cotações de fecho do Yahoo, as quantidades que tinhas na véspera e o câmbio atual. Depois do fecho dos EUA (cerca das 21h00 em Lisboa) o dia fica completo.")
 
 with t_div:
     dfa = positions("pie"); pies_d = [p for p in S["pies"] if not dfa.empty and p in set(dfa["Pie"])]
