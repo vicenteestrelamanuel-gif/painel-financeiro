@@ -316,14 +316,33 @@ def lisboa(d, hm, tz):
     h, m = map(int, hm.split(":")); return dt.datetime(d.year, d.month, d.day, h, m, tzinfo=ZoneInfo(tz)).astimezone(ZoneInfo("Europe/Lisbon")).strftime("%H:%M")
 
 def _cal1(sym):
+    """Calendário do Yahoo; se não trouxer resultados, tenta o histórico de datas e, em último caso, estima (último trimestre + 91 dias)."""
+    out = {}; hoje = dt.date.today()
     try:
-        c = yf.Ticker(sym).calendar; return c if isinstance(c, dict) else {}
+        t = yf.Ticker(sym); c = t.calendar
+        if isinstance(c, dict): out.update(c)
     except Exception:
-        return {}
+        return out
+    if not out.get("Earnings Date"):
+        try:
+            e = t.get_earnings_dates(limit=8)
+            if e is not None and len(e):
+                days = sorted({i.date() for i in e.index}); fut = [x for x in days if x >= hoje]
+                if fut:
+                    out["Earnings Date"] = [fut[0]]
+                    for i, row in e.iterrows():
+                        if i.date() == fut[0] and row.get("EPS Estimate") == row.get("EPS Estimate"): out["Earnings Average"] = row.get("EPS Estimate")
+                else:
+                    d = days[-1] + dt.timedelta(days=91)
+                    while d < hoje: d += dt.timedelta(days=91)
+                    out["Earnings Date"] = [d]; out["_est"] = True
+        except Exception:
+            pass
+    return out
 
 @st.cache_data(ttl=21600)
 def cal_all(syms):
-    with cf.ThreadPoolExecutor(8) as ex: return dict(zip(syms, ex.map(_cal1, syms)))
+    with cf.ThreadPoolExecutor(4) as ex: return dict(zip(syms, ex.map(_cal1, syms)))
 
 def to_date(v):
     try:
@@ -558,9 +577,9 @@ with t_div:
 with t_cal:
     today = dt.date.today(); dfa = positions("pie"); totv = dfa["Valor €"].sum() if not dfa.empty else 0
     usd = dfa[dfa["Moeda"] == "USD"]["Valor €"].sum() / totv * 100 if totv else 0
-    f1, f2 = st.columns([3, 2]); KS = ["🏛️ Mercado e bancos centrais", "📊 Resultados", "💰 Dividendos", "🔕 Feriados e expirações"]
+    f1, f2, f3 = st.columns([3, 2, 2]); KS = ["🏛️ Mercado e bancos centrais", "📊 Resultados", "💰 Dividendos", "🔕 Feriados e expirações"]
     kinds = f1.pills("Tipo", KS, selection_mode="multi", default=KS, label_visibility="collapsed") or []
-    horiz = f2.select_slider("Horizonte", [7, 14, 30, 60, 90, 120, 160], value=30, format_func=lambda n: f"{n} dias"); end = today + dt.timedelta(days=horiz); ev = []
+    horiz = f2.select_slider("Horizonte", [7, 14, 30, 60, 90, 120, 160], value=60, format_func=lambda n: f"{n} dias"); minv = f3.number_input("Mínimo investido por ação (€)", min_value=0.0, value=15.0, step=5.0); end = today + dt.timedelta(days=horiz); ev = []
     for d_, hm, tz, k in MACRO:
         d_ = dt.date.fromisoformat(d_); name = None
         if k.startswith("FERIADO:"): k, name = k.split(":", 1)
@@ -569,16 +588,18 @@ with t_cal:
         ev.append(dict(date=d_, time=lisboa(d_, hm, tz) if hm else None, tag=T["tag"], title=name or T["title"], imp=T["imp"], color=T["color"], desc=T["desc"], watch=T["watch"],
             extra=f"Tens {usd:.0f} % da carteira em dólares" if k in ("FOMC", "CPI", "NFP", "ATAS", "BCE") and usd else ""))
     if (KS[1] in kinds or KS[2] in kinds) and not dfa.empty:
-        pos = dfa.groupby("Ativo").agg(q=("Qtd", "sum"), v=("Valor €", "sum")); sym = {t: S["ymap"].get(t, t) for t in pos.index}
+        pos = dfa.groupby("Ativo").agg(q=("Qtd", "sum"), v=("Valor €", "sum"), c=("Custo €", "sum")); pos = pos[pos["c"] >= minv]; sym = {t: S["ymap"].get(t, t) for t in pos.index}
         with st.spinner("A ir buscar resultados e dividendos das tuas ações (a primeira vez demora)..."): cal = cal_all(tuple(sorted(set(sym.values()))))
+        nf = sum(1 for v in cal.values() if v.get("Earnings Date")); st.caption(f"{len(pos)} ações com pelo menos {num(minv, 0)} € investidos. O Yahoo devolveu data de resultados para {nf}.")
+        if len(pos) and not nf: st.warning("O Yahoo não devolveu nenhuma data de resultados (pode estar a limitar pedidos). Tenta de novo dentro de uns minutos com o botão 🔄 Preços.")
         for tk, r in pos.iterrows():
             c = cal.get(sym[tk]) or {}; w = r.v / totv * 100
             ds = [to_date(x) for x in (c.get("Earnings Date") or [])]; ds = [x for x in ds if x and today <= x <= end]
             if ds and KS[1] in kinds:
                 eps, rev = c.get("Earnings Average"), c.get("Revenue Average")
                 est = (f" Estimativa dos analistas: lucro por ação {eps:.2f}" if eps == eps and eps is not None else "") + (f", receita {rev / 1e9:.2f} mil M." if rev == rev and rev else ".")
-                ev.append(dict(date=ds[0], time=None, tag=f"Resultados · {tk}", title=f"{tk} apresenta resultados", imp=3 if w >= 3 else 2 if w >= 1 else 1, color="#7C5CFF",
-                    desc="A empresa divulga lucros e receitas do trimestre e, muitas vezes, as previsões para os próximos." + est, watch="A surpresa face ao esperado e as previsões futuras: é aqui que as ações mais saltam (para cima ou para baixo), muitas vezes 5 % a 15 %.", extra=f"Pesa {w:.1f} % da tua carteira"))
+                ev.append(dict(date=ds[0], time=None, tag=f"Resultados · {tk}", title=f"{tk} apresenta resultados" + (" (data estimada)" if c.get("_est") else ""), imp=3 if w >= 3 else 2 if w >= 1 else 1, color="#7C5CFF",
+                    desc=("Data estimada a partir do último trimestre: a empresa ainda não a confirmou. " if c.get("_est") else "") + "A empresa divulga lucros e receitas do trimestre e, muitas vezes, as previsões para os próximos." + est, watch="A surpresa face ao esperado e as previsões futuras: é aqui que as ações mais saltam (para cima ou para baixo), muitas vezes 5 % a 15 %.", extra=f"Pesa {w:.1f} % da tua carteira"))
             xd = to_date(c.get("Ex-Dividend Date"))
             if xd and today <= xd <= end and KS[2] in kinds:
                 dv, cur = dps_hist(sym[tk]); pay = to_date(c.get("Dividend Date")); last = float(dv.iloc[-1]) if dv is not None and len(dv) else 0
