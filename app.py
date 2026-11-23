@@ -119,7 +119,7 @@ def ext_prices(syms):
             if x.empty: continue
             ts = x.index[-1]; ts = ts.tz_localize("UTC") if ts.tzinfo is None else ts; ts = ts.tz_convert("America/New_York")
             if now - ts > pd.Timedelta(days=4): continue
-            m = ts.hour * 60 + ts.minute; out[c] = (float(x.iloc[-1]), "Pré" if m < 570 else "Sessão" if m < 960 else "Pós", ts.strftime("%d/%m %H:%M"))
+            m = ts.hour * 60 + ts.minute; out[c] = (float(x.iloc[-1]), "Pré" if m < 570 else "Sessão" if m < 960 else "Pós", ts.strftime("%d/%m %H:%M"), ts.date())
     except Exception:
         pass
     return out
@@ -558,17 +558,36 @@ def lookthrough(tk):
     if (not c or not c["top"]) and tk in LOOK: c = etf_comp(LOOK[tk]); prox = True; used = LOOK[tk]
     return dict(top=c["top"], sectors=c["sectors"], proxy=prox, sym=used) if c and c["top"] else None
 
-def treemap_fig(df, by_pie):
-    """Mapa da carteira: tamanho = valor, cor = lucro/prejuízo (%). Etiquetas explícitas (o texttemplate do px não tem acesso à cor)."""
-    pct = lambda g: (g["Valor €"].sum() / g["Custo €"].sum() - 1) * 100 if g["Custo €"].sum() else 0.0
-    ids, lab, par, val, pc = ["root"], ["Carteira"], [""], [0.0], [pct(df)]
+def day_changes(syms):
+    """Variação do dia (%) por símbolo: preço atual (com pré/pós-mercado, se ligado) face ao fecho anterior."""
+    syms = tuple(sorted(set(syms))); C = closes(syms); out = {}
+    if C.empty: return out
+    EXT = ext_prices(syms) if st.session_state.get("ext_on", True) else {}
+    for sy in syms:
+        if sy not in C.columns: continue
+        x = C[sy].dropna()
+        if len(x) < 2: continue
+        cur_, prev = float(x.iloc[-1]), float(x.iloc[-2]); e = EXT.get(sy)
+        if e:
+            cur_ = e[0]
+            if e[3] > x.index[-1].date(): prev = float(x.iloc[-1])  # novo dia ainda sem barra diária (pré-mercado): compara com o fecho de ontem
+        if prev > 0: out[sy] = (cur_ / prev - 1) * 100
+    return out
+
+def treemap_fig(df, by_pie, daily=True):
+    """Mapa da carteira: tamanho = valor; cor = variação do dia (ou lucro/prejuízo total). Etiquetas explícitas (o texttemplate do px não vê a cor)."""
+    col = "Var. dia %" if daily else "L/P %"; d = df.assign(_c=df[col].astype(float))
+    def pct(g):
+        if daily: m = g["_c"].notna(); return float((g.loc[m, "_c"] * g.loc[m, "Valor €"]).sum() / g.loc[m, "Valor €"].sum()) if m.any() and g.loc[m, "Valor €"].sum() else np.nan
+        return (g["Valor €"].sum() / g["Custo €"].sum() - 1) * 100 if g["Custo €"].sum() else 0.0
+    ids, lab, par, val, pc = ["root"], ["Carteira"], [""], [0.0], [pct(d)]
     if by_pie:
-        for p, g in df.groupby("Pie"): ids.append("p:" + p); lab.append(p); par.append("root"); val.append(0.0); pc.append(pct(g))
-    for _, r in df.iterrows():
-        ids.append(f"a:{r['Pie']}:{r['Ativo']}"); lab.append(r["Ativo"]); par.append("p:" + r["Pie"] if by_pie else "root"); val.append(float(r["Valor €"])); pc.append(float(r["L/P %"]))
-    fig = go.Figure(go.Treemap(ids=ids, labels=lab, parents=par, values=val, branchvalues="remainder", text=[f"{x:+.1f} %" for x in pc], texttemplate="<b>%{label}</b><br>%{text}",
-        hovertemplate="%{label}<br>%{value:,.2f} €<br>%{text}<extra></extra>", marker=dict(colors=pc, colorscale=[[0, DN], [.5, "#F3F2FA"], [1, UP]], cmid=0, cmin=-30, cmax=30, line=dict(width=2))))
-    return fig.update_layout(title="Mapa da carteira: tamanho = valor, cor = lucro/prejuízo", height=380, margin=dict(t=46, b=10, l=10, r=10), paper_bgcolor="rgba(0,0,0,0)")
+        for p, g in d.groupby("Pie"): ids.append("p:" + p); lab.append(p); par.append("root"); val.append(0.0); pc.append(pct(g))
+    for _, r in d.iterrows():
+        ids.append(f"a:{r['Pie']}:{r['Ativo']}"); lab.append(r["Ativo"]); par.append("p:" + r["Pie"] if by_pie else "root"); val.append(float(r["Valor €"])); pc.append(r["_c"])
+    fig = go.Figure(go.Treemap(ids=ids, labels=lab, parents=par, values=val, branchvalues="remainder", text=["—" if x != x else f"{x:+.2f} %" for x in pc], texttemplate="<b>%{label}</b><br>%{text}",
+        hovertemplate="%{label}<br>%{value:,.2f} €<br>%{text}<extra></extra>", marker=dict(colors=[0 if x != x else x for x in pc], colorscale=[[0, DN], [.5, "#F3F2FA"], [1, UP]], cmid=0, cmin=-3 if daily else -30, cmax=3 if daily else 30, line=dict(width=2))))
+    return fig.update_layout(title="Mapa do dia: tamanho = valor, cor = variação do dia" if daily else "Mapa da carteira: tamanho = valor, cor = lucro/prejuízo total", height=380, margin=dict(t=46, b=10, l=10, r=10), paper_bgcolor="rgba(0,0,0,0)")
 
 def parse_csv(f):
     d = pd.read_csv(f); d = d[d["Action"].str.contains("buy|sell", case=False, na=False)]; rows = []
@@ -635,10 +654,13 @@ with t1:
             g = df.groupby("Pie")["Valor €"].sum().reset_index(); fig = px.pie(g, names="Pie", values="Valor €", hole=.62, color="Pie", color_discrete_map={p: pcol(p) for p in g["Pie"]}); ttl = "Alocação por pie"
         fig.update_traces(textinfo="percent", marker_line_width=0)
         a.plotly_chart(fig.update_layout(title=ttl, height=380, margin=dict(t=46, b=10, l=10, r=10), legend=dict(orientation="h"), paper_bgcolor="rgba(0,0,0,0)"), width="stretch")
-        b.plotly_chart(treemap_fig(df, grp.startswith("Sep")), width="stretch")
+        dm = day_changes(tuple(S["ymap"].get(t, t) for t in df["Ativo"]))
+        df.insert(df.columns.get_loc("L/P %") + 1, "Var. dia %", [dm.get(S["ymap"].get(t, t), np.nan) for t in df["Ativo"]])
+        mode = b.radio("Cor do mapa", ["Variação do dia", "Lucro/prejuízo total"], horizontal=True, label_visibility="collapsed", key="tm_mode")
+        b.plotly_chart(treemap_fig(df, grp.startswith("Sep"), mode.startswith("Var")), width="stretch")
         df = df.reset_index(drop=True)
-        sty = df.style.format({"Qtd": "{:.4f}", "Preço": "{:.2f}", "Custo €": "{:.2f}", "Valor €": "{:.2f}", "L/P €": "{:+.2f}", "L/P %": "{:+.2f}", "Fora de horas %": "{:+.2f}", "Peso %": "{:.1f}"}, na_rep="—")
-        sty = styler_map(styler_map(sty, pl_style, ["L/P €", "L/P %"]), lambda p: f"color:{pcol(p)};font-weight:700", ["Pie"])
+        sty = df.style.format({"Qtd": "{:.4f}", "Preço": "{:.2f}", "Custo €": "{:.2f}", "Valor €": "{:.2f}", "L/P €": "{:+.2f}", "L/P %": "{:+.2f}", "Var. dia %": "{:+.2f}", "Fora de horas %": "{:+.2f}", "Peso %": "{:.1f}"}, na_rep="—")
+        sty = styler_map(styler_map(sty, pl_style, ["L/P €", "L/P %", "Var. dia %"]), lambda p: f"color:{pcol(p)};font-weight:700", ["Pie"])
         ev = st.dataframe(sty, hide_index=True, width="stretch", on_select="rerun", selection_mode="single-row", key="pos_tbl",
             column_config={"Peso %": st.column_config.ProgressColumn("Peso", format="%.1f%%", min_value=0, max_value=float(max(df["Peso %"].max(), 1)))})
         rows = ev.selection.rows
