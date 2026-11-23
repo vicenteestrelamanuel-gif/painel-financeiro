@@ -405,6 +405,88 @@ def qty_before(d):
         if t["date"] < str(d): q[(t["pie"], t["tk"])] = q.get((t["pie"], t["tk"]), 0) + (t["qty"] if t["type"] == "Compra" else -t["qty"])
     return {k: v for k, v in q.items() if v > 1e-9}
 
+def gh_grid(vals, year, title, lo, hi):
+    """Grelha estilo GitHub: 1 quadrado por dia do ano (colunas = semanas, linhas = dias da semana); intensidade ~ raiz do valor desse dia."""
+    j1 = dt.date(year, 1, 1); n = (dt.date(year, 12, 31) - j1).days + 1; nw = (n - 1 + j1.weekday()) // 7 + 1
+    z = np.full((7, nw), np.nan); txt = [[None] * nw for _ in range(7)]; vmax = max([v for d_, v in vals.items() if d_.year == year] or [0]); mt, mv = [], []
+    for i in range(n):
+        d_ = j1 + dt.timedelta(days=i); wk, wd = (i + j1.weekday()) // 7, d_.weekday(); v = vals.get(d_, 0.0)
+        z[wd, wk] = 0 if v <= 0 or vmax <= 0 else 0.2 + 0.8 * (v / vmax) ** 0.5
+        txt[wd][wk] = f"{d_.day}/{d_.month}/{d_.year}: " + (f"{num(v)} €" if v > 0 else "sem atividade")
+        if d_.day == 1: mt.append(wk); mv.append(MES[d_.month - 1][:3])
+    fig = go.Figure(go.Heatmap(z=z, text=txt, hoverinfo="text", colorscale=[[0, "#ECEBF7"], [0.001, lo], [1, hi]], zmin=0, zmax=1, showscale=False, xgap=3, ygap=3))
+    fig.update_yaxes(autorange="reversed", tickvals=[0, 2, 4], ticktext=["Seg", "Qua", "Sex"], showgrid=False, zeroline=False, scaleanchor="x", scaleratio=1)
+    fig.update_xaxes(tickvals=mt, ticktext=mv, showgrid=False, zeroline=False, side="top")
+    return fig.update_layout(title=dict(text=title, font=dict(size=15)), height=230, margin=dict(t=64, b=5, l=40, r=5), plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)"), sum(v for d_, v in vals.items() if d_.year == year), sum(1 for d_, v in vals.items() if d_.year == year and v > 0), vmax
+
+# ---- radar de fundamentais
+AXES = ["Crescimento", "Valorização", "Dividendos", "Solidez financeira", "Momento", "Diversificação"]
+lin = lambda x, lo, hi: float(min(1.0, max(0.0, (x - lo) / (hi - lo))) * 100)
+isn = lambda x: isinstance(x, (int, float)) and x == x and abs(x) != float("inf")
+
+@st.cache_data(ttl=21600)
+def fund_all(syms):
+    def one(sym):
+        out = {}
+        try:
+            t = yf.Ticker(sym); i = t.info or {}
+            out = {k: i.get(k) for k in ("quoteType", "sector", "revenueGrowth", "earningsGrowth", "forwardPE", "trailingPE", "debtToEquity", "currentRatio")}
+            try:
+                dv = t.dividends; dv.index = dv.index.tz_localize(None)
+                out["div12"] = float(dv[dv.index >= pd.Timestamp.today() - pd.Timedelta(days=365)].sum()) / (100 if sym.endswith(".L") else 1)
+            except Exception: out["div12"] = None
+        except Exception:
+            pass
+        return out
+    with cf.ThreadPoolExecutor(4) as ex: return dict(zip(syms, ex.map(one, syms)))
+
+@st.cache_data(ttl=3600)
+def closes1y(syms):
+    try:
+        d = yf.download(list(syms), period="14mo", auto_adjust=False, progress=False, group_by="column", threads=True)["Close"]
+        if isinstance(d, pd.Series): d = d.to_frame(syms[0])
+        d.index = pd.to_datetime(d.index).tz_localize(None).normalize(); return d.ffill()
+    except Exception:
+        return pd.DataFrame()
+
+def radar_scores(sub, F, H):
+    """Pontuação 0-100 por eixo. Média ponderada pelo valor de cada posição, só com as posições que têm dados; devolve também a cobertura (% do valor com dados)."""
+    V = sub["Valor €"].astype(float).values; w = V / V.sum() if V.sum() else V; rows = []
+    for (_, r), wi in zip(sub.iterrows(), w):
+        sy = S["ymap"].get(r["Ativo"], r["Ativo"]); f = F.get(sy) or {}; has = bool(f.get("quoteType")); eq = f.get("quoteType") == "EQUITY"
+        px = H[sy].dropna() if sy in H.columns else pd.Series(dtype=float); o = dict(Ativo=r["Ativo"], w=wi, setor=f.get("sector") or ("ETF" if f.get("quoteType") == "ETF" else "Outro"))
+        gs = [(min(max(f[k], -.5), 1.0), q) for k, q in (("revenueGrowth", .6), ("earningsGrowth", .4)) if isn(f.get(k))]  # receita pesa 60 %, lucros 40 %
+        o["gr"] = sum(a * q for a, q in gs) / sum(q for _, q in gs) if gs else None; o["s_cr"] = lin(o["gr"], -.10, .30) if gs else None
+        pe = next((f[k] for k in ("forwardPE", "trailingPE") if isn(f.get(k)) and f[k] > 0), None); o["pe"] = pe; o["ey"] = 1 / pe if pe else (0.0 if eq else None)  # sem lucros = earnings yield 0
+        o["y"] = f["div12"] / r["Preço"] if has and isn(f.get("div12")) and r["Preço"] else None; o["s_dv"] = lin(o["y"], 0, .05) if o["y"] is not None else None
+        de = f.get("debtToEquity") if f.get("sector") != "Financial Services" else None; ps = []
+        if isn(de): o["de"] = de; ps.append((100 - lin(de, 30, 250), .7))
+        if isn(f.get("currentRatio")) and f.get("sector") != "Financial Services": ps.append((lin(f["currentRatio"], .8, 2.0), .3))
+        o["s_so"] = sum(a * q for a, q in ps) / sum(q for _, q in ps) if ps else None
+        n = len(px); r12 = px.iloc[-22] / px.iloc[-253] - 1 if n >= 253 else (px.iloc[-22] / px.iloc[-127] - 1 if n >= 127 else None)  # momento 12-1 meses (ou 6-1 se houver pouco histórico)
+        dist = px.iloc[-1] / px.iloc[-200:].mean() - 1 if n >= 150 else None; o["r12"] = r12
+        o["s_mo"] = (0.7 * lin(r12, -.2, .4) + 0.3 * lin(dist, -.1, .1) if dist is not None else lin(r12, -.2, .4)) if r12 is not None else None; rows.append(o)
+    D = pd.DataFrame(rows)
+    for c_ in ("gr", "s_cr", "pe", "ey", "y", "s_dv", "de", "s_so", "r12", "s_mo"): D[c_] = pd.to_numeric(D[c_], errors="coerce") if c_ in D else np.nan
+    def agg(c):
+        m = D[c].notna()
+        return (float((D.loc[m, c] * D.loc[m, "w"]).sum() / D.loc[m, "w"].sum()), float(D.loc[m, "w"].sum())) if m.any() else (None, 0.0)
+    sc, cv, raw = {}, {}, {}
+    g_, cv["Crescimento"] = agg("gr"); sc["Crescimento"] = agg("s_cr")[0]; raw["Crescimento"] = f"crescimento médio {num(g_ * 100, 1, True)} %" if g_ is not None else "sem dados"
+    ey, cv["Valorização"] = agg("ey"); pe_p = (1 / ey if ey else None); sc["Valorização"] = (lin(45 - pe_p, 0, 35) if pe_p else 0.0) if ey is not None else None; raw["Valorização"] = (f"P/E da carteira {num(pe_p, 1)} (média harmónica)" if pe_p else "empresas sem lucros") if ey is not None else "sem dados"
+    y_, cv["Dividendos"] = agg("y"); sc["Dividendos"] = lin(y_, 0, .05) if y_ is not None else None; raw["Dividendos"] = f"yield {num(y_ * 100, 2)} %" if y_ is not None else "sem dados"
+    sc["Solidez financeira"], cv["Solidez financeira"] = agg("s_so"); de_, _ = agg("de"); raw["Solidez financeira"] = f"dívida/capitais próprios médio {num(de_, 0)} %" if de_ is not None else "sem dados"
+    sc["Momento"], cv["Momento"] = agg("s_mo"); m_, _ = agg("r12"); raw["Momento"] = f"retorno 12-1 meses {num(m_ * 100, 1, True)} %" if m_ is not None else "sem dados"
+    ww = D["w"].values; effn = 1 / (ww ** 2).sum() if len(ww) else 0; sw = D.groupby("setor")["w"].sum().values; effs = 1 / (sw ** 2).sum() if len(sw) else 0; rho = None
+    cols = [S["ymap"].get(a, a) for a in D["Ativo"]]; ok = [(c, wv) for c, wv in zip(cols, ww) if c in H.columns and H[c].dropna().shape[0] >= 120]
+    if len(ok) >= 2:
+        Rt = H[[c for c, _ in ok]].iloc[-252:].pct_change().dropna(how="all").corr().values; wv = np.array([x for _, x in ok]); W = np.outer(wv, wv); np.fill_diagonal(W, 0)
+        rho = float((W * np.nan_to_num(Rt)).sum() / W.sum()) if W.sum() else None
+    parts = [(lin(effn, 1, 25), .4), (lin(effs, 1, 8), .3)] + ([(lin(.8 - rho, 0, .6), .3)] if rho is not None else [])
+    sc["Diversificação"] = sum(a * q for a, q in parts) / sum(q for _, q in parts); cv["Diversificação"] = 1.0
+    raw["Diversificação"] = f"{num(effn, 1)} posições efetivas · {num(effs, 1)} setores efetivos" + (f" · correlação média {num(rho, 2)}" if rho is not None else "")
+    return dict(sc=sc, cv=cv, raw=raw, D=D)
+
 def parse_csv(f):
     d = pd.read_csv(f); d = d[d["Action"].str.contains("buy|sell", case=False, na=False)]; rows = []
     d["_ts"] = pd.to_datetime(d["Time (UTC)"], utc=True).astype("int64") / 1e9
@@ -424,7 +506,7 @@ def parse_csv(f):
 
 st.markdown('<div class="brand">📈 Painel Financeiro</div>', unsafe_allow_html=True)
 top = st.container()
-t1, t_day, t_div, t_cal, t2, t3 = st.tabs(["Portfólio", "Resumo do dia", "Dividendos", "Calendário", "Transações", "Despesas"])
+t1, t_rad, t_day, t_div, t_cal, t2, t3 = st.tabs(["Portfólio", "Radar", "Resumo do dia", "Dividendos", "Calendário", "Transações", "Despesas"])
 
 # ================= PORTFÓLIO =================
 with t1:
@@ -689,6 +771,43 @@ with t_div:
             fig = px.bar(R, x="Mês", y="€", color="Pie", color_discrete_map={p: pcol(p) for p in R["Pie"].unique()}, title="Dividendos recebidos por mês")
             b.plotly_chart(fig.update_layout(height=320, xaxis_title=None, margin=dict(t=46, b=10), paper_bgcolor="rgba(0,0,0,0)"), width="stretch")
         else: b.info("Ainda não registaste dividendos recebidos. Importa o CSV de dividendos da Trading 212 ou regista à mão (em baixo).")
+        td = dt.date.today(); aport, divd = {}, {}
+        for t in S["tx"]:
+            if t["type"] == "Compra" and (pick == "Todas" or t["pie"] == pick):
+                d_ = dt.date.fromisoformat(t["date"]); aport[d_] = aport.get(d_, 0) + t["qty"] * t["price"] * rate_of(t["cur"], t["fx"])
+        for x in rec: d_ = dt.date.fromisoformat(x["date"]); divd[d_] = divd.get(d_, 0) + recv(x)
+        st.markdown("#### Calendário anual de atividade")
+        yrs = sorted({d_.year for d_ in list(aport) + list(divd)} | {td.year}, reverse=True); ysel = st.radio("Ano", yrs, horizontal=True, key="cal_year", label_visibility="collapsed")
+        for vals, ttl, lo, hi in ((divd, "Dividendos recebidos", "#BDEBD0", "#0B7A3B"), (aport, "Aportes (todas as compras)", "#D8D2FF", "#4B2FD6")):
+            fig, tot, nd, vm = gh_grid(vals, ysel, f"{ttl} em {ysel}", lo, hi); st.plotly_chart(fig, width="stretch", key=f"gh_{ttl}")
+            st.caption(f"{num(tot)} € no ano  ·  {nd} dias com atividade  ·  maior dia: {num(vm)} €")
+        st.markdown("#### Bola de neve")
+        if divd:
+            mdiv = pd.Series(divd).groupby(lambda k: pd.Timestamp(k).to_period("M")).sum(); mapo = pd.Series(aport).groupby(lambda k: pd.Timestamp(k).to_period("M")).sum()
+            ms = pd.period_range(min(mdiv.index.min(), mapo.index.min() if len(mapo) else mdiv.index.min()), td, freq="M"); mdiv = mdiv.reindex(ms, fill_value=0); mapo = mapo.reindex(ms, fill_value=0)
+            lab_ = [str(p) for p in ms]; fig = make_subplots(specs=[[{"secondary_y": True}]])
+            fig.add_trace(go.Bar(x=lab_, y=mdiv.values, name="Dividendos do mês (€)", marker_color=UP), secondary_y=False)
+            fig.add_trace(go.Scatter(x=lab_, y=mdiv.cumsum().values, name="Dividendos acumulados (€)", line=dict(color="#14142B", width=3)), secondary_y=True)
+            fig.add_trace(go.Scatter(x=lab_, y=mapo.cumsum().values, name="Aportes acumulados (€)", line=dict(color="#7C5CFF", width=2, dash="dot")), secondary_y=True)
+            st.plotly_chart(fig.update_layout(height=360, margin=dict(t=30, b=10), legend=dict(orientation="h", y=1.12), paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)"), width="stretch")
+            ta = mapo.sum(); st.caption(f"Já recebeste {num(mdiv.sum())} € em dividendos, {num(mdiv.sum() / ta * 100 if ta else 0)} % do que aportaste ({num(ta)} €).")
+        else: st.info("Sem dividendos registados para este gráfico. Importa o CSV da Trading 212 em baixo.")
+        st.markdown("#### Yield on cost vs yield atual")
+        scope = [t for t in S["tx"] if (t["pie"] in pies_d if pick == "Todas" else t["pie"] == pick)]; dl = sorted((k, v) for k, v in divd.items())
+        if len(dl) < 2 or not scope: st.info("Precisas de dividendos registados para este gráfico.")
+        else:
+            tlY = tl_of("sel:" + pick, scope); first = dl[0][0]; pts = []
+            for _, g_ in tlY.groupby(tlY.index.to_period("M")):
+                t_ = g_.index[-1].date(); w = min(90, (t_ - first).days + 1)
+                if w < 30: continue
+                ann = sum(v for k, v in dl if t_ - dt.timedelta(days=w) < k <= t_) * 365 / w; r_ = g_.iloc[-1]
+                pts.append((t_, ann / r_["Valor investido"] * 100 if r_["Valor investido"] > 0 else np.nan, ann / r_["Valor atual"] * 100 if r_["Valor atual"] > 0 else np.nan))
+            if len(pts) < 2: st.info("Ainda há pouco histórico (menos de 2 meses desde o primeiro dividendo).")
+            else:
+                P_ = pd.DataFrame(pts, columns=["Data", "Yield on cost", "Yield atual"])
+                fig = go.Figure([go.Scatter(x=P_["Data"], y=P_["Yield on cost"], name="Yield on cost (sobre o que investiste)", line=dict(color=col, width=3)), go.Scatter(x=P_["Data"], y=P_["Yield atual"], name="Yield atual (sobre o valor de mercado)", line=dict(color="#94A3B8", width=2, dash="dash"))])
+                st.plotly_chart(fig.update_layout(height=340, yaxis=dict(ticksuffix=" %", gridcolor="#E7E5F0"), margin=dict(t=30, b=10), legend=dict(orientation="h", y=1.12), paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)"), width="stretch")
+            st.caption(f"Estimativa a 12 meses (forward): yield on cost {num(est / C * 100 if C else 0)} % · yield atual {num(est / V * 100 if V else 0)} %. Séries calculadas com os dividendos recebidos nos últimos 90 dias, anualizados, a dividir pelo custo e pelo valor de mercado de cada mês. O yield on cost fica acima do yield atual quando os preços subiram desde a compra (e abaixo quando desceram); com o tempo cresce se os dividendos por ação aumentarem ou se reinvestires.")
         sty = T.style.format({"Qtd": "{:.4f}", "Div./ação 12m": "{:.3f}", "Estimado €/ano": "{:.2f}", "Yield s/ custo %": "{:.2f}", "Yield s/ valor %": "{:.2f}", "Recebido €": "{:.2f}"}, na_rep="—")
         sty = styler_map(sty, lambda p: f"color:{pcol(p)};font-weight:700", ["Pie"])
         st.dataframe(sty, hide_index=True, width="stretch", column_config={"Estimado €/ano": st.column_config.ProgressColumn("Estimado €/ano", format="%.2f", min_value=0, max_value=float(max(T["Estimado €/ano"].max(), 0.01)))})
@@ -758,6 +877,47 @@ with t_cal:
                 f'<div style="color:#3D3C5C;font-size:.92rem;margin-top:5px">{e["desc"]}</div><div style="color:#3D3C5C;font-size:.92rem;margin-top:4px"><b>O que observar:</b> {e["watch"]}</div>'
                 f'<div style="margin-top:6px"><span class="chip nt">Importância {"alta" if e["imp"] == 3 else "média" if e["imp"] == 2 else "baixa"}</span>' + (f'<span class="chip nt">{e["extra"]}</span>' if e["extra"] else "") + "</div></div>", unsafe_allow_html=True)
     st.caption("Datas oficiais do BLS (inflação e emprego), da Fed e do BCE, confirmadas até abril de 2027; horas convertidas para Lisboa. Resultados e dividendos das tuas ações vêm do Yahoo e podem mudar. O calendário da Fed para 2027 foi revisto em novembro de 2026 (a reunião de outubro de 2027 não terá decisão de juros). Não é aconselhamento financeiro.")
+
+with t_rad:
+    dfa = positions("pie")
+    if dfa.empty: st.info("Sem posições abertas.")
+    else:
+        pies_r = [p for p in S["pies"] if p in set(dfa["Pie"])]; pick = st.pills("Pie", ["Todas"] + pies_r, default="Todas", key="rad_pie", label_visibility="collapsed") or "Todas"
+        syms = tuple(sorted({S["ymap"].get(t, t) for t in dfa["Ativo"]}))
+        with st.spinner("A recolher fundamentais e histórico de preços (a primeira vez demora)..."): F = fund_all(syms); H = closes1y(syms)
+        if not any(F.values()): st.warning("O Yahoo não devolveu fundamentais agora (pode estar a limitar pedidos). Tenta de novo dentro de uns minutos com o botão 🔄 Preços.")
+        R = {p: radar_scores(dfa[dfa["Pie"] == p], F, H) for p in pies_r}; show = pies_r if pick == "Todas" else [pick]
+        fig = go.Figure()
+        for p in show:
+            sc = R[p]["sc"]; v = [sc[a] if sc[a] is not None else 0 for a in AXES]; c_ = pcol(p).lstrip("#"); rgb = ",".join(str(int(c_[i:i + 2], 16)) for i in (0, 2, 4))
+            fig.add_trace(go.Scatterpolar(r=v + v[:1], theta=AXES + AXES[:1], name=p, fill="toself", fillcolor=f"rgba({rgb},{0.30 if len(show) == 1 else 0.12})", line=dict(color=pcol(p), width=3), hovertemplate="%{theta}: %{r:.0f}/100<extra>" + p + "</extra>"))
+        fig.update_layout(polar=dict(radialaxis=dict(range=[0, 100], tickvals=[25, 50, 75, 100], gridcolor="#DAD8EA", tickfont=dict(size=10)), angularaxis=dict(tickfont=dict(size=13)), bgcolor="rgba(0,0,0,0)"), height=520, margin=dict(t=30, b=30, l=60, r=60), legend=dict(orientation="h", y=-.08), paper_bgcolor="rgba(0,0,0,0)")
+        a, b = st.columns([3, 2]); a.plotly_chart(fig, width="stretch")
+        with b:
+            for p in show:
+                sc = R[p]["sc"]; ok_ = [(x, sc[x]) for x in AXES if sc[x] is not None and R[p]["cv"][x] >= .2]; ok_.sort(key=lambda z: -z[1])
+                if len(ok_) >= 3: st.markdown(card(f"Perfil · {p}", f"{ok_[0][0]} e {ok_[1][0]}", f'<span class="chip nt">ponto fraco: {ok_[-1][0]} ({ok_[-1][1]:.0f}/100)</span>', pcol(p)), unsafe_allow_html=True)
+            st.caption("Cada eixo vai de 0 a 100 (100 = melhor). Eixos com menos de 20 % do valor com dados ficam a 0 e estão marcados como 'sem dados fiáveis' na tabela.")
+        T = pd.DataFrame([{"Pie": p, **{a: R[p]["sc"][a] for a in AXES}} for p in show]).set_index("Pie")
+        st.dataframe(T.style.format("{:.0f}", na_rep="—"), width="stretch", column_config={a: st.column_config.ProgressColumn(a, min_value=0, max_value=100, format="%.0f") for a in AXES})
+        for p in show:
+            with st.expander(f"Detalhe e cobertura · {p}", expanded=len(show) == 1):
+                Q = pd.DataFrame([{"Eixo": a, "Pontuação": R[p]["sc"][a], "Medida": R[p]["raw"][a], "Cobertura": f"{R[p]['cv'][a] * 100:.0f} % do valor" + ("" if R[p]["cv"][a] >= .2 else " · sem dados fiáveis")} for a in AXES])
+                st.dataframe(Q.style.format({"Pontuação": "{:.0f}"}, na_rep="—"), hide_index=True, width="stretch")
+                Dd = R[p]["D"].copy(); Dd["Peso %"] = Dd["w"] * 100
+                st.dataframe(Dd[["Ativo", "Peso %", "setor", "gr", "pe", "y", "de", "r12"]].rename(columns={"setor": "Setor", "gr": "Crescimento", "pe": "P/E", "y": "Yield", "de": "Dív./Capitais %", "r12": "Momento 12-1"}).sort_values("Peso %", ascending=False).style.format({"Peso %": "{:.1f}", "Crescimento": "{:+.1%}", "P/E": "{:.1f}", "Yield": "{:.2%}", "Dív./Capitais %": "{:.0f}", "Momento 12-1": "{:+.1%}"}, na_rep="—"), hide_index=True, width="stretch")
+        with st.expander("Como cada eixo é calculado"):
+            st.markdown("""
+| Eixo | Medida | 0 pontos | 100 pontos |
+|---|---|---|---|
+| **Crescimento** | crescimento anual da receita (60 %) e dos lucros (40 %), limitado a −50 %/+100 % por ação | −10 % | +30 % |
+| **Valorização** | P/E da carteira = média **harmónica** ponderada (equivale a 1 ÷ earnings yield médio); usa o P/E futuro, ou o dos últimos 12 meses; empresas sem lucros contam como earnings yield 0 | P/E ≥ 45 | P/E ≤ 10 |
+| **Dividendos** | yield médio ponderado: dividendos dos últimos 12 meses ÷ preço | 0 % | 5 % |
+| **Solidez financeira** | dívida/capitais próprios (70 %) e rácio de liquidez corrente (30 %); bancos e seguradoras ficam de fora da dívida | D/E ≥ 250 % | D/E ≤ 30 % |
+| **Momento** | momento clássico 12−1 meses (ignora o último mês) com 70 %, e distância à média de 200 dias com 30 % | −20 % | +40 % |
+| **Diversificação** | posições efetivas 1/Σw² (40 %), setores efetivos (30 %) e correlação média ponderada entre posições nos últimos 12 meses (30 %) | 1 posição, 1 setor, correlação 0,8 | 25 posições, 8 setores, correlação 0,2 |
+
+Todas as médias são ponderadas pelo valor de cada posição, só com as posições que têm dados, e a tabela mostra a cobertura. Os fundamentais vêm do Yahoo Finance (podem estar atrasados ou em falta, sobretudo em ETFs) e são uma fotografia de hoje, não histórico. Não é aconselhamento financeiro.""")
 
 with top:
     b1, b2, b3, _ = st.columns([1.2, 1.4, 1, 4])
