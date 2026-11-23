@@ -105,6 +105,25 @@ def rate_of(c, fb=1.0):
     """Câmbio atual para €: manual (se definido) > Yahoo ao vivo > último guardado."""
     return 1.0 if c == "EUR" else (S.get("fxman", {}).get(c) or fx_live(c) or S["fx"].get(c) or fb)
 
+@st.cache_data(ttl=300)
+def ext_prices(syms):
+    """Último preço em barras de 1 minuto incl. pré e pós-mercado (ações dos EUA): {símbolo: (preço, 'Pré'|'Sessão'|'Pós', hora)}."""
+    us = [x for x in syms if "." not in x and "=" not in x and not x.startswith("^")]; out = {}
+    if not us: return out
+    try:
+        d = yf.download(us, period="2d", interval="1m", prepost=True, progress=False, group_by="column", threads=True)["Close"]
+        if isinstance(d, pd.Series): d = d.to_frame(us[0])
+        now = pd.Timestamp.now(tz="America/New_York")
+        for c in d.columns:
+            x = d[c].dropna()
+            if x.empty: continue
+            ts = x.index[-1]; ts = ts.tz_localize("UTC") if ts.tzinfo is None else ts; ts = ts.tz_convert("America/New_York")
+            if now - ts > pd.Timedelta(days=4): continue
+            m = ts.hour * 60 + ts.minute; out[c] = (float(x.iloc[-1]), "Pré" if m < 570 else "Sessão" if m < 960 else "Pós", ts.strftime("%d/%m %H:%M"))
+    except Exception:
+        pass
+    return out
+
 def positions(group):
     m, last = {}, {}
     for t in sorted(S["tx"], key=lambda t: t["date"]):
@@ -116,17 +135,22 @@ def positions(group):
         else:
             f = min(1, t["qty"] / p["Qtd"]) if p["Qtd"] > 0 else 0
             p["CN"] -= p["CN"] * f; p["Qtd"] -= t["qty"]
-    out = []
+    out = []; ext_on = st.session_state.get("ext_on", True)
+    EXT = ext_prices(tuple(sorted({S["ymap"].get(p["Ativo"], p["Ativo"]) for p in m.values() if p["Qtd"] > 1e-9}))) if ext_on else {}
     for p in m.values():
         if p["Qtd"] <= 1e-9: continue
-        l = last[p["Ativo"]]
-        price, cur = quote(S["ymap"].get(p["Ativo"], p["Ativo"]))
-        live = price is not None
+        l = last[p["Ativo"]]; sy = S["ymap"].get(p["Ativo"], p["Ativo"])
+        price, cur = quote(sy)
+        live = price is not None; src = "ao vivo" if live else "último preço"; fh = 0.0
+        if live and cur == "USD" and EXT.get(sy):
+            e = EXT[sy]
+            if e[1] in ("Pré", "Pós"): fh = (e[0] / price - 1) * 100; src = "pré-mercado" if e[1] == "Pré" else "pós-mercado"
+            price = e[0]
         if not live: price, cur = S["px"].get(p["Ativo"], l["price"]), l["cur"]
         val = p["Qtd"] * price * rate_of(cur, l["fx"]); custo = p["CN"] * rate_of(l["cur"], l["fx"])  # custo = qtd x preço de compra, convertido ao câmbio atual
         out.append({"Ativo": p["Ativo"], "Pie": p["Pie"] if group == "pie" else ", ".join(sorted(p["pies"])), "Moeda": cur, "Qtd": p["Qtd"],
             "Preço": price, "Custo €": custo, "Valor €": val, "L/P €": val - custo, "L/P %": (val / custo - 1) * 100 if custo else 0,
-            "Fonte": "ao vivo" if live else "último preço"})
+            "Fonte": src, "Fora de horas %": fh})
     df = pd.DataFrame(out)
     if not df.empty: df["Peso %"] = df["Valor €"] / df["Valor €"].sum() * 100
     return df.sort_values("Valor €", ascending=False) if not df.empty else df
@@ -228,7 +252,8 @@ def detail(tk):
     d = h[h.index >= start]
     if len(d) < 3: st.warning("Poucos dados neste período."); return
     c = d["Close"]; r = c.pct_change().dropna(); dd = c / c.cummax() - 1; i = info(sym)
-    t_stats, t_graf, t_prev, t_dados = st.tabs(["Estatísticas", "Gráficos", "Previsão", "Dados"])
+    is_etf = i.get("quoteType") == "ETF" or tk in LOOK
+    tt = st.tabs(["Estatísticas", "Gráficos", "Previsão", "Dados"] + (["Composição"] if is_etf else [])); t_stats, t_graf, t_prev, t_dados = tt[:4]
     with t_stats:
         k = st.columns(4); k[0].metric(f"Preço ({cur})", f"{c.iloc[-1]:,.2f}"); k[1].metric(f"Retorno ({per})", f"{(c.iloc[-1]/c.iloc[0]-1)*100:+.2f} %")
         k[2].metric("Máximo / Mínimo", f"{c.max():,.2f} / {c.min():,.2f}"); k[3].metric("Volatilidade anual", f"{r.std()*np.sqrt(252)*100:.1f} %")
@@ -266,6 +291,22 @@ def detail(tk):
     with t_dados:
         st.dataframe(d[["Open", "High", "Low", "Close", "Volume"]].sort_index(ascending=False).style.format("{:,.2f}", subset=["Open", "High", "Low", "Close"]), width="stretch", height=300)
         if txs: st.markdown("**As minhas transações**"); st.dataframe(pd.DataFrame(txs).drop(columns=["id", "bid"], errors="ignore").sort_values("date", ascending=False), hide_index=True, width="stretch")
+    if is_etf:
+        with tt[4]:
+            lt = lookthrough(tk)
+            if not lt: st.info("O Yahoo não tem a composição deste ETF.")
+            else:
+                if lt["proxy"]: st.warning(f"Composição aproximada: o Yahoo não tem a composição exata de {sym}, por isso uso o ETF americano {lt['sym']} como proxy. Os pesos podem diferir.")
+                Hd = pd.DataFrame(lt["top"], columns=["Símbolo", "Empresa", "Peso"]); Hd["Peso %"] = Hd["Peso"] * 100; k = st.columns(3)
+                k[0].metric("Top 10 pesa", f"{Hd['Peso'].head(10).sum() * 100:.1f} %"); k[1].metric("Maior posição", f"{Hd['Símbolo'].iloc[0]} {Hd['Peso %'].iloc[0]:.1f} %"); k[2].metric("Fora das posições listadas", f"{max(0, 1 - Hd['Peso'].sum()) * 100:.1f} %")
+                a_, b_ = st.columns(2); a_.dataframe(Hd[["Símbolo", "Empresa", "Peso %"]].style.format({"Peso %": "{:.2f}"}), hide_index=True, width="stretch", height=360)
+                if lt["sectors"]:
+                    Sd = pd.DataFrame({"Setor": list(lt["sectors"]), "Peso %": [v * 100 for v in lt["sectors"].values()]}).sort_values("Peso %")
+                    b_.plotly_chart(px.bar(Sd, x="Peso %", y="Setor", orientation="h", title="Peso por setor (%)").update_traces(marker_color="#6D5BF7").update_layout(height=360, margin=dict(t=40, b=10), yaxis_title=None, paper_bgcolor="rgba(0,0,0,0)"), width="stretch")
+                mine = positions("pie"); mine = mine[mine["Ativo"] != tk]; own = {S["ymap"].get(r_["Ativo"], r_["Ativo"]): (r_["Valor €"], r_["Pie"]) for _, r_ in mine.iterrows()}
+                both = [(x, own[x]) for x in Hd["Símbolo"] if x in own]
+                if both: st.info("Também tens diretamente: " + ", ".join(f"{x} ({num(v[0])} € em {v[1]})" for x, v in both) + ". Esta exposição soma-se à que tens através do ETF.")
+                st.caption("Dados do Yahoo Finance: só as maiores posições do ETF estão listadas. Não é aconselhamento financeiro.")
 
 @st.cache_data(ttl=21600)
 def dps_hist(sym):
@@ -449,7 +490,7 @@ def closes1y(syms):
     except Exception:
         return pd.DataFrame()
 
-def radar_scores(sub, F, H):
+def radar_scores(sub, F, H, LT=None):
     """Pontuação 0-100 por eixo. Média ponderada pelo valor de cada posição, só com as posições que têm dados; devolve também a cobertura (% do valor com dados)."""
     V = sub["Valor €"].astype(float).values; w = V / V.sum() if V.sum() else V; rows = []
     for (_, r), wi in zip(sub.iterrows(), w):
@@ -471,21 +512,63 @@ def radar_scores(sub, F, H):
     def agg(c):
         m = D[c].notna()
         return (float((D.loc[m, c] * D.loc[m, "w"]).sum() / D.loc[m, "w"].sum()), float(D.loc[m, "w"].sum())) if m.any() else (None, 0.0)
-    sc, cv, raw = {}, {}, {}
+    LT = LT or {}; sc, cv, raw = {}, {}, {}
     g_, cv["Crescimento"] = agg("gr"); sc["Crescimento"] = agg("s_cr")[0]; raw["Crescimento"] = f"crescimento médio {num(g_ * 100, 1, True)} %" if g_ is not None else "sem dados"
     ey, cv["Valorização"] = agg("ey"); pe_p = (1 / ey if ey else None); sc["Valorização"] = (lin(45 - pe_p, 0, 35) if pe_p else 0.0) if ey is not None else None; raw["Valorização"] = (f"P/E da carteira {num(pe_p, 1)} (média harmónica)" if pe_p else "empresas sem lucros") if ey is not None else "sem dados"
     y_, cv["Dividendos"] = agg("y"); sc["Dividendos"] = lin(y_, 0, .05) if y_ is not None else None; raw["Dividendos"] = f"yield {num(y_ * 100, 2)} %" if y_ is not None else "sem dados"
     sc["Solidez financeira"], cv["Solidez financeira"] = agg("s_so"); de_, _ = agg("de"); raw["Solidez financeira"] = f"dívida/capitais próprios médio {num(de_, 0)} %" if de_ is not None else "sem dados"
     sc["Momento"], cv["Momento"] = agg("s_mo"); m_, _ = agg("r12"); raw["Momento"] = f"retorno 12-1 meses {num(m_ * 100, 1, True)} %" if m_ is not None else "sem dados"
-    ww = D["w"].values; effn = 1 / (ww ** 2).sum() if len(ww) else 0; sw = D.groupby("setor")["w"].sum().values; effs = 1 / (sw ** 2).sum() if len(sw) else 0; rho = None
+    lw, sec = [], {}  # linhas efetivas e pesos por setor, vendo através dos ETFs (top holdings + o resto em linhas de 1 %)
+    for _, o in D.iterrows():
+        lt = LT.get(o["Ativo"])
+        if lt:
+            tops = [x[2] for x in lt["top"]]; lw += [o["w"] * x for x in tops] + [o["w"] * .01] * int(round(max(0.0, 1 - sum(tops)) / .01)); ss = sum(lt["sectors"].values())
+            for k_, v_ in (lt["sectors"].items() if ss else [("ETF", 1.0)]): sec[k_] = sec.get(k_, 0) + o["w"] * v_ / (ss or 1)
+        else: lw.append(o["w"]); sec[o["setor"]] = sec.get(o["setor"], 0) + o["w"]
+    ww = np.array(lw); effn = 1 / (ww ** 2).sum() if len(ww) else 0; sw = np.array(list(sec.values())); effs = 1 / (sw ** 2).sum() if len(sw) else 0; rho = None
     cols = [S["ymap"].get(a, a) for a in D["Ativo"]]; ok = [(c, wv) for c, wv in zip(cols, ww) if c in H.columns and H[c].dropna().shape[0] >= 120]
     if len(ok) >= 2:
         Rt = H[[c for c, _ in ok]].iloc[-252:].pct_change().dropna(how="all").corr().values; wv = np.array([x for _, x in ok]); W = np.outer(wv, wv); np.fill_diagonal(W, 0)
         rho = float((W * np.nan_to_num(Rt)).sum() / W.sum()) if W.sum() else None
     parts = [(lin(effn, 1, 25), .4), (lin(effs, 1, 8), .3)] + ([(lin(.8 - rho, 0, .6), .3)] if rho is not None else [])
     sc["Diversificação"] = sum(a * q for a, q in parts) / sum(q for _, q in parts); cv["Diversificação"] = 1.0
-    raw["Diversificação"] = f"{num(effn, 1)} posições efetivas · {num(effs, 1)} setores efetivos" + (f" · correlação média {num(rho, 2)}" if rho is not None else "")
+    raw["Diversificação"] = f"{num(effn, 1)} posições efetivas · {num(effs, 1)} setores efetivos" + (" (vendo através dos ETFs)" if any(LT.get(a_) for a_ in D["Ativo"]) else "") + (f" · correlação média {num(rho, 2)}" if rho is not None else "")
     return dict(sc=sc, cv=cv, raw=raw, D=D)
+
+LOOK = {"EUNL": "URTH", "QDVE": "XLK", "EUNK": "IEUR", "IS3N": "IEMG", "QUTM": "QTUM"}  # ETFs europeus (UCITS) sem composição no Yahoo: ETF americano equivalente como proxy aproximado
+SEC_MAP = {"realestate": "Real Estate", "consumer_cyclical": "Consumer Cyclical", "basic_materials": "Basic Materials", "consumer_defensive": "Consumer Defensive", "technology": "Technology", "communication_services": "Communication Services",
+           "financial_services": "Financial Services", "utilities": "Utilities", "industrials": "Industrials", "energy": "Energy", "healthcare": "Healthcare"}
+
+@st.cache_data(ttl=86400)
+def etf_comp(sym):
+    try:
+        fd = yf.Ticker(sym).funds_data; th = fd.top_holdings; top = []
+        if th is not None and len(th):
+            for idx, row in th.iterrows():
+                w = next((row[c] for c in th.columns if "percent" in str(c).lower() or "weight" in str(c).lower()), None); nm = next((row[c] for c in th.columns if "name" in str(c).lower()), "")
+                if isn(w): top.append((str(idx), str(nm), float(w)))
+        if top and sum(x[2] for x in top) > 1.5: top = [(a, b, c / 100) for a, b, c in top]
+        sw = {SEC_MAP.get(k, str(k).replace("_", " ").title()): float(v) for k, v in (fd.sector_weightings or {}).items() if isn(v) and v > 0}
+        return dict(top=top, sectors=sw)
+    except Exception:
+        return None
+
+def lookthrough(tk):
+    sym = S["ymap"].get(tk, tk); c = etf_comp(sym); prox = False; used = sym
+    if (not c or not c["top"]) and tk in LOOK: c = etf_comp(LOOK[tk]); prox = True; used = LOOK[tk]
+    return dict(top=c["top"], sectors=c["sectors"], proxy=prox, sym=used) if c and c["top"] else None
+
+def treemap_fig(df, by_pie):
+    """Mapa da carteira: tamanho = valor, cor = lucro/prejuízo (%). Etiquetas explícitas (o texttemplate do px não tem acesso à cor)."""
+    pct = lambda g: (g["Valor €"].sum() / g["Custo €"].sum() - 1) * 100 if g["Custo €"].sum() else 0.0
+    ids, lab, par, val, pc = ["root"], ["Carteira"], [""], [0.0], [pct(df)]
+    if by_pie:
+        for p, g in df.groupby("Pie"): ids.append("p:" + p); lab.append(p); par.append("root"); val.append(0.0); pc.append(pct(g))
+    for _, r in df.iterrows():
+        ids.append(f"a:{r['Pie']}:{r['Ativo']}"); lab.append(r["Ativo"]); par.append("p:" + r["Pie"] if by_pie else "root"); val.append(float(r["Valor €"])); pc.append(float(r["L/P %"]))
+    fig = go.Figure(go.Treemap(ids=ids, labels=lab, parents=par, values=val, branchvalues="remainder", text=[f"{x:+.1f} %" for x in pc], texttemplate="<b>%{label}</b><br>%{text}",
+        hovertemplate="%{label}<br>%{value:,.2f} €<br>%{text}<extra></extra>", marker=dict(colors=pc, colorscale=[[0, DN], [.5, "#F3F2FA"], [1, UP]], cmid=0, cmin=-30, cmax=30, line=dict(width=2))))
+    return fig.update_layout(title="Mapa da carteira: tamanho = valor, cor = lucro/prejuízo", height=380, margin=dict(t=46, b=10, l=10, r=10), paper_bgcolor="rgba(0,0,0,0)")
 
 def parse_csv(f):
     d = pd.read_csv(f); d = d[d["Action"].str.contains("buy|sell", case=False, na=False)]; rows = []
@@ -512,9 +595,9 @@ t1, t_rad, t_day, t_div, t_cal, t2, t3 = st.tabs(["Portfólio", "Radar", "Resumo
 with t1:
     dfa = positions("pie")
     if not dfa.empty:
-        VA, CA = dfa["Valor €"].sum(), dfa["Custo €"].sum(); LA = VA - CA
+        VA, CA = dfa["Valor €"].sum(), dfa["Custo €"].sum(); LA = VA - CA; ext_chip = '<span class="chip nt">inclui pré/pós-mercado</span>' if dfa["Fonte"].isin(["pré-mercado", "pós-mercado"]).any() else ""
         st.markdown(f'<div class="hero"><small>Valor da carteira</small><div class="big">{num(VA)} €</div>{chip(LA, f"{num(LA, 2, True)} €  ·  {num(LA / CA * 100 if CA else 0, 2, True)} %")}'
-            f'<span class="chip nt">Investido {num(CA)} €</span></div>', unsafe_allow_html=True)
+            f'<span class="chip nt">Investido {num(CA)} €</span>{ext_chip}</div>', unsafe_allow_html=True)
         gp = dfa.groupby("Pie").agg(v=("Valor €", "sum"), c=("Custo €", "sum")).sort_values("v", ascending=False)
         for i in range(0, len(gp), 4):
             cols = st.columns(4)
@@ -552,12 +635,9 @@ with t1:
             g = df.groupby("Pie")["Valor €"].sum().reset_index(); fig = px.pie(g, names="Pie", values="Valor €", hole=.62, color="Pie", color_discrete_map={p: pcol(p) for p in g["Pie"]}); ttl = "Alocação por pie"
         fig.update_traces(textinfo="percent", marker_line_width=0)
         a.plotly_chart(fig.update_layout(title=ttl, height=380, margin=dict(t=46, b=10, l=10, r=10), legend=dict(orientation="h"), paper_bgcolor="rgba(0,0,0,0)"), width="stretch")
-        tm = df.assign(Carteira="Carteira"); path = ["Carteira", "Pie", "Ativo"] if grp.startswith("Sep") else ["Carteira", "Ativo"]
-        fig = px.treemap(tm, path=path, values="Valor €", color="L/P %", color_continuous_scale=[[0, DN], [.5, "#F3F2FA"], [1, UP]], range_color=(-30, 30))
-        fig.update_traces(texttemplate="<b>%{label}</b><br>%{color:+.1f}%", marker_line_width=2)
-        b.plotly_chart(fig.update_layout(title="Mapa da carteira: tamanho = valor, cor = lucro/prejuízo", height=380, margin=dict(t=46, b=10, l=10, r=10), coloraxis_showscale=False, paper_bgcolor="rgba(0,0,0,0)"), width="stretch")
+        b.plotly_chart(treemap_fig(df, grp.startswith("Sep")), width="stretch")
         df = df.reset_index(drop=True)
-        sty = df.style.format({"Qtd": "{:.4f}", "Preço": "{:.2f}", "Custo €": "{:.2f}", "Valor €": "{:.2f}", "L/P €": "{:+.2f}", "L/P %": "{:+.2f}", "Peso %": "{:.1f}"}, na_rep="—")
+        sty = df.style.format({"Qtd": "{:.4f}", "Preço": "{:.2f}", "Custo €": "{:.2f}", "Valor €": "{:.2f}", "L/P €": "{:+.2f}", "L/P %": "{:+.2f}", "Fora de horas %": "{:+.2f}", "Peso %": "{:.1f}"}, na_rep="—")
         sty = styler_map(styler_map(sty, pl_style, ["L/P €", "L/P %"]), lambda p: f"color:{pcol(p)};font-weight:700", ["Pie"])
         ev = st.dataframe(sty, hide_index=True, width="stretch", on_select="rerun", selection_mode="single-row", key="pos_tbl",
             column_config={"Peso %": st.column_config.ProgressColumn("Peso", format="%.1f%%", min_value=0, max_value=float(max(df["Peso %"].max(), 1)))})
@@ -886,7 +966,10 @@ with t_rad:
         syms = tuple(sorted({S["ymap"].get(t, t) for t in dfa["Ativo"]}))
         with st.spinner("A recolher fundamentais e histórico de preços (a primeira vez demora)..."): F = fund_all(syms); H = closes1y(syms)
         if not any(F.values()): st.warning("O Yahoo não devolveu fundamentais agora (pode estar a limitar pedidos). Tenta de novo dentro de uns minutos com o botão 🔄 Preços.")
-        R = {p: radar_scores(dfa[dfa["Pie"] == p], F, H) for p in pies_r}; show = pies_r if pick == "Todas" else [pick]
+        LT = {tk: lt for tk in dfa["Ativo"].unique() if (F.get(S["ymap"].get(tk, tk)) or {}).get("quoteType") == "ETF" or tk in LOOK for lt in [lookthrough(tk)] if lt}
+        etfs_ = [tk for tk in dfa["Ativo"].unique() if (F.get(S["ymap"].get(tk, tk)) or {}).get("quoteType") == "ETF" or tk in LOOK]
+        if etfs_: st.caption("ETFs vistos por dentro (composição): " + (", ".join(f"{k}" + (" (proxy " + v["sym"] + ")" if v["proxy"] else "") for k, v in LT.items()) or "nenhum") + (". Sem composição, tratados como uma só posição: " + ", ".join(t for t in etfs_ if t not in LT) if any(t not in LT for t in etfs_) else ""))
+        R = {p: radar_scores(dfa[dfa["Pie"] == p], F, H, LT) for p in pies_r}; show = pies_r if pick == "Todas" else [pick]
         fig = go.Figure()
         for p in show:
             sc = R[p]["sc"]; v = [sc[a] if sc[a] is not None else 0 for a in AXES]; c_ = pcol(p).lstrip("#"); rgb = ",".join(str(int(c_[i:i + 2], 16)) for i in (0, 2, 4))
@@ -906,6 +989,16 @@ with t_rad:
                 st.dataframe(Q.style.format({"Pontuação": "{:.0f}"}, na_rep="—"), hide_index=True, width="stretch")
                 Dd = R[p]["D"].copy(); Dd["Peso %"] = Dd["w"] * 100
                 st.dataframe(Dd[["Ativo", "Peso %", "setor", "gr", "pe", "y", "de", "r12"]].rename(columns={"setor": "Setor", "gr": "Crescimento", "pe": "P/E", "y": "Yield", "de": "Dív./Capitais %", "r12": "Momento 12-1"}).sort_values("Peso %", ascending=False).style.format({"Peso %": "{:.1f}", "Crescimento": "{:+.1%}", "P/E": "{:.1f}", "Yield": "{:.2%}", "Dív./Capitais %": "{:.0f}", "Momento 12-1": "{:+.1%}"}, na_rep="—"), hide_index=True, width="stretch")
+        with st.expander("Exposição real: direta + através dos ETFs"):
+            ex = {}
+            for _, r_ in dfa[dfa["Pie"].isin(show)].iterrows():
+                lt = LT.get(r_["Ativo"])
+                if lt:
+                    for sy_, nm_, w_ in lt["top"]: e_ = ex.setdefault(sy_, dict(Empresa=nm_, Direto=0.0, ETFs=0.0)); e_["ETFs"] += r_["Valor €"] * w_
+                else: e_ = ex.setdefault(S["ymap"].get(r_["Ativo"], r_["Ativo"]), dict(Empresa=r_["Ativo"], Direto=0.0, ETFs=0.0)); e_["Direto"] += r_["Valor €"]
+            X = pd.DataFrame(ex).T.reset_index().rename(columns={"index": "Símbolo"}); tv = dfa[dfa["Pie"].isin(show)]["Valor €"].sum()
+            if len(X): X["Total €"] = X["Direto"] + X["ETFs"]; X["% do total"] = X["Total €"] / tv * 100; st.dataframe(X.sort_values("Total €", ascending=False).head(20).style.format({"Direto": "{:.2f}", "ETFs": "{:.2f}", "Total €": "{:.2f}", "% do total": "{:.1f}"}), hide_index=True, width="stretch")
+            st.caption("Só as maiores posições de cada ETF (top holdings) entram aqui; o resto do ETF não está detalhado. Para ETFs sem composição no Yahoo usa-se um ETF americano equivalente como proxy aproximado.")
         with st.expander("Como cada eixo é calculado"):
             st.markdown("""
 | Eixo | Medida | 0 pontos | 100 pontos |
@@ -915,12 +1008,12 @@ with t_rad:
 | **Dividendos** | yield médio ponderado: dividendos dos últimos 12 meses ÷ preço | 0 % | 5 % |
 | **Solidez financeira** | dívida/capitais próprios (70 %) e rácio de liquidez corrente (30 %); bancos e seguradoras ficam de fora da dívida | D/E ≥ 250 % | D/E ≤ 30 % |
 | **Momento** | momento clássico 12−1 meses (ignora o último mês) com 70 %, e distância à média de 200 dias com 30 % | −20 % | +40 % |
-| **Diversificação** | posições efetivas 1/Σw² (40 %), setores efetivos (30 %) e correlação média ponderada entre posições nos últimos 12 meses (30 %) | 1 posição, 1 setor, correlação 0,8 | 25 posições, 8 setores, correlação 0,2 |
+| **Diversificação** | posições efetivas 1/Σw² (40 %), setores efetivos (30 %) e correlação média ponderada entre posições nos últimos 12 meses (30 %). Os ETFs são vistos por dentro: as maiores posições de cada um contam como posições próprias, o resto conta como linhas de 1 %, e os setores vêm da composição do ETF | 1 posição, 1 setor, correlação 0,8 | 25 posições, 8 setores, correlação 0,2 |
 
 Todas as médias são ponderadas pelo valor de cada posição, só com as posições que têm dados, e a tabela mostra a cobertura. Os fundamentais vêm do Yahoo Finance (podem estar atrasados ou em falta, sobretudo em ETFs) e são uma fotografia de hoje, não histórico. Não é aconselhamento financeiro.""")
 
 with top:
-    b1, b2, b3, _ = st.columns([1.2, 1.4, 1, 4])
+    b1, b2, b3, b4, _ = st.columns([1.2, 1.4, 1, 1.7, 2.4]); b4.toggle("Pré/pós-mercado", value=True, key="ext_on")
     if b1.button("➕ Transação", type="primary", width="stretch"): dlg_add()
     if b2.button("📥 Importar CSV", width="stretch"): dlg_imp()
     if b3.button("🔄 Preços", width="stretch"): st.cache_data.clear(); st.rerun()
