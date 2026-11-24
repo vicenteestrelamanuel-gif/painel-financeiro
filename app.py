@@ -4,6 +4,7 @@ from plotly.subplots import make_subplots
 from zoneinfo import ZoneInfo
 from itertools import groupby
 import concurrent.futures as cf
+import time
 
 st.set_page_config(page_title="Painel Financeiro", page_icon="📈", layout="wide")
 if "dark" not in st.session_state: st.session_state["dark"] = st.query_params.get("tema") == "escuro"  # o tema guarda-se no endereço (?tema=escuro)
@@ -494,21 +495,36 @@ AXES = ["Crescimento", "Valorização", "Dividendos", "Solidez financeira", "Mom
 lin = lambda x, lo, hi: float(min(1.0, max(0.0, (x - lo) / (hi - lo))) * 100)
 isn = lambda x: isinstance(x, (int, float)) and x == x and abs(x) != float("inf")
 
-@st.cache_data(ttl=21600)
-def fund_all(syms):
-    def one(sym):
-        out = {}
+def _fund1(sym):
+    """Fundamentais de um ativo no Yahoo. Devolve {} se o Yahoo não responder (sem 'quoteType' = falhou)."""
+    try:
+        t = yf.Ticker(sym); i = t.info or {}
+        if not i.get("quoteType"): return {}
+        out = {k: i.get(k) for k in ("quoteType", "sector", "revenueGrowth", "earningsGrowth", "forwardPE", "trailingPE", "debtToEquity", "currentRatio")}
         try:
-            t = yf.Ticker(sym); i = t.info or {}
-            out = {k: i.get(k) for k in ("quoteType", "sector", "revenueGrowth", "earningsGrowth", "forwardPE", "trailingPE", "debtToEquity", "currentRatio")}
-            try:
-                dv = t.dividends; dv.index = dv.index.tz_localize(None)
-                out["div12"] = float(dv[dv.index >= pd.Timestamp.today() - pd.Timedelta(days=365)].sum()) / (100 if sym.endswith(".L") else 1)
-            except Exception: out["div12"] = None
-        except Exception:
-            pass
+            dv = t.dividends; dv.index = dv.index.tz_localize(None)
+            out["div12"] = float(dv[dv.index >= pd.Timestamp.today() - pd.Timedelta(days=365)].sum()) / (100 if sym.endswith(".L") else 1)
+        except Exception: out["div12"] = None
         return out
-    with cf.ThreadPoolExecutor(4) as ex: return dict(zip(syms, ex.map(one, syms)))
+    except Exception:
+        return {}
+
+@st.cache_resource
+def _fund_store(): return {}  # símbolo -> (hora, dados); os sucessos ficam guardados e só se repetem os que falharam
+
+def fund_all(syms, force=False):
+    store = _fund_store(); now = time.time()
+    todo = [x for x in syms if force and not (store.get(x) or (0, {}))[1] or x not in store or now - store[x][0] > (21600 if store[x][1] else 600)]
+    def job(sym):
+        for k in range(2):
+            r = _fund1(sym)
+            if r: return r
+            time.sleep(1.5)
+        return {}
+    if todo:
+        with cf.ThreadPoolExecutor(3) as ex:
+            for sy, r in zip(todo, ex.map(job, todo)): store[sy] = (now, r)
+    return {x: (store.get(x) or (0, {}))[1] for x in syms}
 
 @st.cache_data(ttl=3600)
 def closes1y(syms):
@@ -1047,7 +1063,9 @@ with t_rad:
         pies_r = [p for p in S["pies"] if p in set(dfa["Pie"])]; pick = st.pills("Pie", ["Todas"] + pies_r, default="Todas", key="rad_pie", label_visibility="collapsed") or "Todas"
         syms = tuple(sorted({S["ymap"].get(t, t) for t in dfa["Ativo"]}))
         with st.spinner("A recolher fundamentais e histórico de preços (a primeira vez demora)..."): F = fund_all(syms); H = closes1y(syms)
-        if not any(F.values()): st.warning("O Yahoo não devolveu fundamentais agora (pode estar a limitar pedidos). Tenta de novo dentro de uns minutos com o botão 🔄 Preços.")
+        n_ok = sum(1 for v in F.values() if v.get("quoteType")); c_a, c_b = st.columns([4, 1])
+        (c_a.warning if n_ok < len(syms) * 0.6 else c_a.caption)(f"Fundamentais obtidos para {n_ok} de {len(syms)} ativos." + ("" if n_ok >= len(syms) * 0.6 else " O Yahoo não respondeu aos restantes (costuma limitar pedidos); os eixos sem dados ficam a 0. Espera uns minutos e tenta de novo."))
+        if c_b.button("🔁 Tentar de novo", key="rad_retry"): F = fund_all(syms, force=True); st.rerun()
         LT = {tk: lt for tk in dfa["Ativo"].unique() if (F.get(S["ymap"].get(tk, tk)) or {}).get("quoteType") == "ETF" or tk in LOOK for lt in [lookthrough(tk)] if lt}
         etfs_ = [tk for tk in dfa["Ativo"].unique() if (F.get(S["ymap"].get(tk, tk)) or {}).get("quoteType") == "ETF" or tk in LOOK]
         if etfs_: st.caption("ETFs vistos por dentro (composição): " + (", ".join(f"{k}" + (" (proxy " + v["sym"] + ")" if v["proxy"] else "") for k, v in LT.items()) or "nenhum") + (". Sem composição, tratados como uma só posição: " + ", ".join(t for t in etfs_ if t not in LT) if any(t not in LT for t in etfs_) else ""))
