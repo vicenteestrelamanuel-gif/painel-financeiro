@@ -6,7 +6,7 @@ from itertools import groupby
 import concurrent.futures as cf
 
 st.set_page_config(page_title="Painel Financeiro", page_icon="📈", layout="wide")
-PIE_COL = {"Quantum": "#7C5CFF", "Alone Stocks": "#0FB5A6", "Daily Dividend": "#F59E0B", "ETFs": "#3B82F6"}
+PIE_COL = {"Quantum": "#7C5CFF", "Alone Stocks": "#0FB5A6", "Daily Dividend": "#F59E0B", "ETFs": "#3B82F6", "Sem pie": "#64748B"}
 CAT_COL = {"Restaurantes": "#F97316", "Supermercado": "#84CC16", "Subscrições": "#A855F7", "Transportes": "#06B6D4", "Lazer": "#EC4899", "Saúde": "#EF4444", "Material Escolar": "#3B82F6", "Investido": "#F59E0B", "Outros": "#94A3B8"}
 EXTRA = ["#EC4899", "#84CC16", "#06B6D4", "#F97316", "#A855F7", "#64748B", "#EF4444"]
 UP, DN = "#12A150", "#E5484D"
@@ -149,16 +149,18 @@ def ext_prices(syms):
     return r
 
 def positions(group):
-    m, last = {}, {}
+    m, last, ACC = {}, {}, {}  # ACC: quantidade e custo (€, câmbio de cada compra) por ativo, somando todas as pies
     for t in sorted(S["tx"], key=lambda t: t["date"]):
-        last[t["tk"]] = t
+        last[t["tk"]] = t; ac = ACC.setdefault(t["tk"], [0.0, 0.0])
+        if t["type"] == "Compra": ac[0] += t["qty"]; ac[1] += t["qty"] * t["price"] * t["fx"]
+        else: g = min(1, t["qty"] / ac[0]) if ac[0] > 0 else 0; ac[1] -= ac[1] * g; ac[0] -= t["qty"]
         p = m.setdefault((t["pie"] if group == "pie" else "—", t["tk"]), dict(Pie=t["pie"] if group == "pie" else "—", Ativo=t["tk"], Qtd=0.0, Custo=0.0, CN=0.0, pies=set()))
         p["pies"].add(t["pie"])
         if t["type"] == "Compra":
-            p["Qtd"] += t["qty"]; p["CN"] += t["qty"] * t["price"]
+            p["Qtd"] += t["qty"]; p["CN"] += t["qty"] * t["price"]; p["Custo"] += t["qty"] * t["price"] * t["fx"]
         else:
             f = min(1, t["qty"] / p["Qtd"]) if p["Qtd"] > 0 else 0
-            p["CN"] -= p["CN"] * f; p["Qtd"] -= t["qty"]
+            p["CN"] -= p["CN"] * f; p["Custo"] -= p["Custo"] * f; p["Qtd"] -= t["qty"]
     out = []; ext_on = st.session_state.get("ext_on", True)
     EXT = ext_prices(tuple(sorted({S["ymap"].get(p["Ativo"], p["Ativo"]) for p in m.values() if p["Qtd"] > 1e-9}))) if ext_on else {}
     for p in m.values():
@@ -171,7 +173,7 @@ def positions(group):
             if e[1] in ("Pré", "Pós"): fh = (e[0] / price - 1) * 100; src = "pré-mercado" if e[1] == "Pré" else "pós-mercado"; hora = e[2]
             price = e[0]
         if not live: price, cur = S["px"].get(p["Ativo"], l["price"]), l["cur"]
-        val = p["Qtd"] * price * rate_of(cur, l["fx"]); custo = p["CN"] * rate_of(l["cur"], l["fx"])  # custo = qtd x preço de compra, convertido ao câmbio atual
+        val = p["Qtd"] * price * rate_of(cur, l["fx"]); custo = (p["Qtd"] * ACC[p["Ativo"]][1] / ACC[p["Ativo"]][0] if ACC[p["Ativo"]][0] > 1e-9 else 0.0) if st.session_state.get("cost_hist", True) else p["CN"] * rate_of(l["cur"], l["fx"])  # custo médio da conta (por ativo) ao câmbio de cada compra (como a Trading 212) ou, desligado, qtd x preço de compra ao câmbio atual
         out.append({"Ativo": p["Ativo"], "Pie": p["Pie"] if group == "pie" else ", ".join(sorted(p["pies"])), "Moeda": cur, "Qtd": p["Qtd"],
             "Preço": price, "Custo €": custo, "Valor €": val, "L/P €": val - custo, "L/P %": (val / custo - 1) * 100 if custo else 0,
             "Fonte": src, "Fora de horas %": fh, "Hora (ET)": hora})
@@ -196,20 +198,20 @@ def timeline(txs):
     inv = pd.Series(0.0, index=days); val = inv.copy(); groups = {}
     for t in sorted(txs, key=lambda t: t["date"]): groups.setdefault((t["pie"], t["tk"]), []).append(t)
     for (pie, tk), L in groups.items():
-        q = c = 0.0; ev = {}
+        q = c = ce = 0.0; ev = {}
         for t in L:
-            if t["type"] == "Compra": q += t["qty"]; c += t["qty"] * t["price"]
+            if t["type"] == "Compra": q += t["qty"]; c += t["qty"] * t["price"]; ce += t["qty"] * t["price"] * t["fx"]
             else:
-                f = min(1, t["qty"] / q) if q > 0 else 0; c -= c * f; q -= t["qty"]
-            ev[pd.Timestamp(t["date"])] = (q, c)
-        s = pd.DataFrame(ev, index=["q", "c"]).T
+                f = min(1, t["qty"] / q) if q > 0 else 0; c -= c * f; ce -= ce * f; q -= t["qty"]
+            ev[pd.Timestamp(t["date"])] = (q, c, ce)
+        s = pd.DataFrame(ev, index=["q", "c", "ce"]).T
         s = s.reindex(s.index.union(days)).ffill().reindex(days).fillna(0)
         p, cur = hist(S["ymap"].get(tk, tk), L[0]["date"])
         if p is None or p.empty:  # sem histórico: usa os preços das compras
             cur = L[-1]["cur"]; p = pd.Series({pd.Timestamp(t["date"]): t["price"] for t in L}); p = p[~p.index.duplicated(keep="last")]
         p = p.reindex(p.index.union(days)).ffill().bfill().reindex(days)
         r = rate_of(cur, L[-1]["fx"])
-        inv += s["c"] * rate_of(L[-1]["cur"], L[-1]["fx"]); val += s["q"] * p * r
+        inv += s["ce"] if st.session_state.get("cost_hist", True) else s["c"] * rate_of(L[-1]["cur"], L[-1]["fx"]); val += s["q"] * p * r
     return pd.DataFrame({"Valor investido": inv, "Valor atual": val})
 
 def show_tl(txs, title, key, color="#6D5BF7", tl=None):
@@ -613,6 +615,19 @@ def treemap_fig(df, by_pie, daily=True):
         hovertemplate="%{label}<br>%{value:,.2f} €<br>%{text}<extra></extra>", marker=dict(colors=[0 if x != x else x for x in pc], colorscale=[[0, DN], [.5, "#F3F2FA"], [1, UP]], cmid=0, cmin=-3 if daily else -30, cmax=3 if daily else 30, line=dict(width=2))))
     return fig.update_layout(title="Mapa do dia: tamanho = valor, cor = variação do dia" if daily else "Mapa da carteira: tamanho = valor, cor = lucro/prejuízo total", height=380, margin=dict(t=46, b=10, l=10, r=10), paper_bgcolor="rgba(0,0,0,0)")
 
+def recon_table(c, P_):
+    """Compara o CSV de uma pie da Trading 212 (Slice, Invested value, Value, Owned quantity) com as posições da app (índice = Ativo)."""
+    c = c[c["Slice"] != "Total"].copy(); c["q"] = pd.to_numeric(c["Owned quantity"], errors="coerce"); c = c[c["q"].notna()].set_index("Slice"); rows = []
+    for tk in sorted(set(c.index) | set(P_.index)):
+        a, b = (P_.loc[tk] if tk in P_.index else None), (c.loc[tk] if tk in c.index else None)
+        qa, qt = (float(a["Qtd"]) if a is not None else 0.0), (float(b["q"]) if b is not None else 0.0)
+        ia, it = (float(a["Custo €"]) if a is not None else 0.0), (float(b["Invested value"]) if b is not None else 0.0)
+        va, vt = (float(a["Valor €"]) if a is not None else 0.0), (float(b["Value"]) if b is not None else 0.0)
+        rows.append({"Ativo": tk, "Qtd app": qa, "Qtd T212": qt, "Δ qtd": qa - qt, "Investido app": ia, "Investido T212": it, "Δ investido": ia - it, "Valor app": va, "Valor T212": vt, "Δ valor": va - vt,
+            "Preço app €": va / qa if qa else np.nan, "Preço T212 €": vt / qt if qt else np.nan})
+    R = pd.DataFrame(rows); R["Δ preço %"] = (R["Preço app €"] / R["Preço T212 €"] - 1) * 100
+    return R
+
 def parse_csv(f):
     d = pd.read_csv(f); d = d[d["Action"].str.contains("buy|sell", case=False, na=False)]; rows = []
     d["_ts"] = pd.to_datetime(d["Time (UTC)"], utc=True).astype("int64") / 1e9
@@ -758,6 +773,15 @@ with t2:
             st.info(f"O ficheiro substitui: {', '.join(parts)} (o resto fica como está). Transações: {len(S['tx'])} atuais → {len(new.get('tx', S['tx']))} no ficheiro.")
             if st.checkbox("Já exportei um backup dos dados atuais") and st.button("Substituir dados", type="primary"):
                 S.update({k: new[k] for k in parts}); save(); st.success("Dados substituídos."); st.rerun()
+    with st.expander("🧾 Reconciliar com a Trading 212 (CSV de uma pie)"):
+        up_r = st.file_uploader("CSV da pie (Trading 212 → pie → exportar)", type="csv", key="recon"); pie_r = st.selectbox("Pie na app", S["pies"], key="recon_pie")
+        if up_r:
+            Pp = positions("pie"); Pp = Pp[Pp["Pie"] == pie_r].set_index("Ativo"); R = recon_table(pd.read_csv(up_r), Pp)
+            tot = R[["Investido app", "Investido T212", "Valor app", "Valor T212"]].sum(); k = st.columns(4)
+            k[0].metric("Investido (app / T212)", f"{tot['Investido app']:.2f} / {tot['Investido T212']:.2f}", f"{tot['Investido app'] - tot['Investido T212']:+.2f} €"); k[1].metric("Valor (app / T212)", f"{tot['Valor app']:.2f} / {tot['Valor T212']:.2f}", f"{tot['Valor app'] - tot['Valor T212']:+.2f} €")
+            k[2].metric("Posições com qtd diferente", int((R["Δ qtd"].abs() > 1e-5).sum())); k[3].metric("Preço app vs T212 (mediana)", f"{R['Δ preço %'].median():+.2f} %")
+            st.dataframe(styler_map(R.style.format({"Qtd app": "{:.6f}", "Qtd T212": "{:.6f}", "Δ qtd": "{:+.6f}", "Investido app": "{:.2f}", "Investido T212": "{:.2f}", "Δ investido": "{:+.2f}", "Valor app": "{:.2f}", "Valor T212": "{:.2f}", "Δ valor": "{:+.2f}", "Preço app €": "{:.3f}", "Preço T212 €": "{:.3f}", "Δ preço %": "{:+.2f}"}, na_rep="—"), lambda v: "" if pd.isna(v) or abs(v) < 0.05 else f"color:{DN};font-weight:700", ["Δ investido", "Δ valor", "Δ preço %"]), hide_index=True, width="stretch")
+            st.caption("Qtd e investido devem bater (até cêntimos). O valor depende do preço e do câmbio do momento: se o 'Δ preço %' for parecido em todas as ações dos EUA, é o câmbio; se variar de ação para ação, é o preço (pré/pós-mercado). Compara com o interruptor Pré/pós-mercado ligado e desligado.")
     with st.expander("💱 Câmbio de conversão para euros"):
         S.setdefault("fxman", {}); curs = sorted({t["cur"] for t in S["tx"]} - {"EUR"})
         st.caption("O custo (quantidade × preço de compra) e o valor atual são calculados na moeda da ação e convertidos para € ao câmbio atual. É o do Yahoo, ao vivo; aqui podes fixar outro.")
@@ -1069,7 +1093,7 @@ with t_rad:
 Todas as médias são ponderadas pelo valor de cada posição, só com as posições que têm dados, e a tabela mostra a cobertura. Os fundamentais vêm do Yahoo Finance (podem estar atrasados ou em falta, sobretudo em ETFs) e são uma fotografia de hoje, não histórico. Não é aconselhamento financeiro.""")
 
 with top:
-    b1, b2, b3, b4, _ = st.columns([1.2, 1.4, 1, 1.7, 2.4]); b4.toggle("Pré/pós-mercado", value=True, key="ext_on")
+    b1, b2, b3, b4, b5, _ = st.columns([1.1, 1.3, 0.9, 1.6, 2.2, 0.7]); b4.toggle("Pré/pós-mercado", value=True, key="ext_on"); b5.toggle("Custo ao câmbio da compra", value=True, key="cost_hist")
     if b1.button("➕ Transação", type="primary", width="stretch"): dlg_add()
     if b2.button("📥 Importar CSV", width="stretch"): dlg_imp()
     if b3.button("🔄 Preços", width="stretch"): st.cache_data.clear(); st.rerun()
