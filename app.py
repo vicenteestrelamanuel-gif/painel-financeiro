@@ -42,6 +42,7 @@ html,body,.stApp,.stApp p,.stApp label,.stApp button,.stApp input,.stApp textare
 div[data-testid="stMetric"]{background:#fff;border-radius:14px;padding:10px 14px;box-shadow:0 1px 4px rgba(20,20,43,.07)}
 div[data-testid="stExpander"]{background:#fff;border-radius:14px;border:0;box-shadow:0 1px 4px rgba(20,20,43,.07)}
 .stButton>button,.stDownloadButton>button{border-radius:12px;font-weight:700}
+.fv{width:100%;border-collapse:collapse;font-size:.8rem}.fv td{padding:4px 7px;border-bottom:1px solid #ECEBF7;white-space:nowrap}.fv td.k{color:#6B6A8C}.fv td.v{font-weight:700;text-align:right}.fv tr:nth-child(even){background:#F7F6FC}
 </style>""", unsafe_allow_html=True)
 if st.session_state.get("dark"):  # tema escuro: inverte a página toda (o painel escuro e as imagens voltam a inverter para manterem o aspeto)
     st.markdown("""<style>html{filter:invert(.9) hue-rotate(180deg)}.hero,img,[data-testid="stImage"]{filter:invert(.9) hue-rotate(180deg)}</style>""", unsafe_allow_html=True)
@@ -268,6 +269,81 @@ def info(sym):
 
 PER = {"1M": 30, "3M": 91, "6M": 182, "YTD": None, "1A": 365, "2A": 730, "5A": 1826, "Máx": 0}
 
+# ---- ficha de uma ação estilo Finviz (dados do Yahoo) + gráficos financeiros (GAAP)
+@st.cache_data(ttl=21600)
+def fin_data(sym):
+    out = {}
+    try:
+        t = yf.Ticker(sym)
+        for k, a in (("ia", "income_stmt"), ("iq", "quarterly_income_stmt"), ("cfa", "cashflow"), ("cfq", "quarterly_cashflow"), ("bsa", "balance_sheet"), ("bsq", "quarterly_balance_sheet")):
+            try: df = getattr(t, a); out[k] = df if df is not None and not df.empty else None
+            except Exception: out[k] = None
+        for k, a in (("pt", "analyst_price_targets"), ("rec", "recommendations_summary")):
+            try: out[k] = getattr(t, a)
+            except Exception: out[k] = None
+        try: out["ed"] = t.get_earnings_dates(limit=12)
+        except Exception: out["ed"] = None
+    except Exception:
+        pass
+    return out
+
+def frow(df, names):
+    if df is None: return pd.Series(dtype=float)
+    for n in names:
+        if n in df.index: return pd.to_numeric(df.loc[n], errors="coerce").dropna().sort_index()
+    return pd.Series(dtype=float)
+
+def big(x):
+    if x is None or x != x: return "-"
+    a = abs(x); sg = "-" if x < 0 else ""
+    for u, n in ((1e12, "T"), (1e9, "B"), (1e6, "M"), (1e3, "K")):
+        if a >= u: return f"{sg}{a / u:.2f}{n}"
+    return f"{x:.2f}"
+
+def snap_items(i, h):
+    """Os campos da página de uma ação no Finviz, calculados com o info do Yahoo e o histórico de preços."""
+    h = h.dropna(subset=["Close"]); c = h["Close"]; px = float(c.iloc[-1]); g = lambda k: i.get(k) if isn(i.get(k)) else None
+    pf = lambda n: (px / float(c.iloc[-1 - n]) - 1) * 100 if len(c) > n else None
+    y0 = c[c.index >= pd.Timestamp(dt.date.today().year, 1, 1)]; ytd = (px / float(y0.iloc[0]) - 1) * 100 if len(y0) else None
+    sma = lambda n: (px / float(c.iloc[-n:].mean()) - 1) * 100 if len(c) >= n else None
+    dl = c.diff(); up = dl.clip(lower=0).ewm(alpha=1 / 14, adjust=False).mean(); dn = (-dl.clip(upper=0)).ewm(alpha=1 / 14, adjust=False).mean(); rsi = float(100 - 100 / (1 + up.iloc[-1] / dn.iloc[-1])) if dn.iloc[-1] else None
+    tr = pd.concat([h["High"] - h["Low"], (h["High"] - c.shift()).abs(), (h["Low"] - c.shift()).abs()], axis=1).max(axis=1); atr = float(tr.ewm(alpha=1 / 14, adjust=False).mean().iloc[-1])
+    hi, lo = float(c.iloc[-252:].max()), float(c.iloc[-252:].min()); vol = h["Volume"].dropna(); rv = float(vol.iloc[-1] / vol.iloc[-64:-1].mean()) if len(vol) > 64 and vol.iloc[-64:-1].mean() else None
+    N = lambda x, d=2: "-" if x is None else f"{x:,.{d}f}"; Pc = lambda x, d=2: "-" if x is None else f"{x:+.{d}f}%"; Fr = lambda x: "-" if x is None else f"{x * 100:.2f}%"; B = lambda x: "-" if x is None else big(x)
+    col = lambda x: None if x is None or x == 0 else (UP if x > 0 else DN)
+    dr, cps, fcf, mc = g("dividendRate"), g("totalCashPerShare"), g("freeCashflow"), g("marketCap"); de = g("debtToEquity")
+    return [("Market Cap", B(mc), None), ("Income", B(g("netIncomeToCommon")), None), ("Sales", B(g("totalRevenue")), None), ("Book/sh", N(g("bookValue")), None), ("Cash/sh", N(cps), None), ("Dividend", N(dr), None),
+        ("P/E", N(g("trailingPE")), None), ("Forward P/E", N(g("forwardPE")), None), ("PEG", N(g("trailingPegRatio") or g("pegRatio")), None), ("P/S", N(g("priceToSalesTrailing12Months")), None), ("P/B", N(g("priceToBook")), None), ("P/C", N(px / cps if cps else None), None),
+        ("P/FCF", N(mc / fcf if mc and fcf and fcf > 0 else None), None), ("Quick Ratio", N(g("quickRatio")), None), ("Current Ratio", N(g("currentRatio")), None), ("Debt/Eq", N(de / 100 if de is not None else None), None), ("EPS (ttm)", N(g("trailingEps")), col(g("trailingEps"))), ("EPS next Y", N(g("forwardEps")), col(g("forwardEps"))),
+        ("EPS Q/Q", Fr(g("earningsQuarterlyGrowth")), col(g("earningsQuarterlyGrowth"))), ("Sales Q/Q", Fr(g("revenueGrowth")), col(g("revenueGrowth"))), ("ROA", Fr(g("returnOnAssets")), col(g("returnOnAssets"))), ("ROE", Fr(g("returnOnEquity")), col(g("returnOnEquity"))), ("Gross Margin", Fr(g("grossMargins")), None), ("Oper. Margin", Fr(g("operatingMargins")), col(g("operatingMargins"))),
+        ("Profit Margin", Fr(g("profitMargins")), col(g("profitMargins"))), ("Payout", Fr(g("payoutRatio")), None), ("Dividend %", Pc(dr / px * 100 if dr else None).replace("+", ""), None), ("Insider Own", Fr(g("heldPercentInsiders")), None), ("Inst Own", Fr(g("heldPercentInstitutions")), None), ("Short Float", Fr(g("shortPercentOfFloat")), None),
+        ("Short Ratio", N(g("shortRatio")), None), ("Shs Outstand", B(g("sharesOutstanding")), None), ("Shs Float", B(g("floatShares")), None), ("Beta", N(g("beta")), None), ("ATR (14)", N(atr), None), ("RSI (14)", N(rsi, 1), DN if rsi and rsi > 70 else (UP if rsi and rsi < 30 else None)),
+        ("SMA20", Pc(sma(20)), col(sma(20))), ("SMA50", Pc(sma(50)), col(sma(50))), ("SMA200", Pc(sma(200)), col(sma(200))), ("52W High", Pc((px / hi - 1) * 100), col((px / hi - 1) * 100)), ("52W Low", Pc((px / lo - 1) * 100), col((px / lo - 1) * 100)), ("Perf Week", Pc(pf(5)), col(pf(5))),
+        ("Perf Month", Pc(pf(21)), col(pf(21))), ("Perf Quarter", Pc(pf(63)), col(pf(63))), ("Perf Half Y", Pc(pf(126)), col(pf(126))), ("Perf Year", Pc(pf(252)), col(pf(252))), ("Perf YTD", Pc(ytd), col(ytd)), ("Avg Volume", B(g("averageVolume")), None),
+        ("Rel Volume", N(rv), None), ("Volume", B(float(vol.iloc[-1])) if len(vol) else "-", None), ("Price", N(px), None), ("Target Price", N(g("targetMeanPrice")), None), ("Recom", N(g("recommendationMean"), 1), None), ("Employees", N(g("fullTimeEmployees"), 0), None),
+        ("Prev Close", N(float(c.iloc[-2]) if len(c) > 1 else None), None), ("Change", Pc(pf(1)), col(pf(1))), ("Analistas", N(g("numberOfAnalystOpinions"), 0), None), ("Float %", Fr(g("floatShares") / g("sharesOutstanding") if g("floatShares") and g("sharesOutstanding") else None), None), ("EV", B(g("enterpriseValue")), None), ("EV/EBITDA", N(g("enterpriseToEbitda")), None)]
+
+def snap_html(items):
+    return '<table class="fv">' + "".join("<tr>" + "".join(f'<td class="k">{l}</td><td class="v" style="color:{c or "inherit"}">{v}</td>' for l, v, c in items[k:k + 6]) + "</tr>" for k in range(0, len(items), 6)) + "</table>"
+
+def fin_charts(F_, per, cur):
+    a = per == "Anual"; I, CF, BS = F_.get("ia" if a else "iq"), F_.get("cfa" if a else "cfq"), F_.get("bsa" if a else "bsq")
+    rev, gp, oi = frow(I, ["Total Revenue", "Operating Revenue"]), frow(I, ["Gross Profit"]), frow(I, ["Operating Income"]); ni, eps = frow(I, ["Net Income", "Net Income Common Stockholders"]), frow(I, ["Diluted EPS", "Basic EPS"])
+    ocf, fcf, cap = frow(CF, ["Operating Cash Flow", "Cash Flow From Continuing Operating Activities"]), frow(CF, ["Free Cash Flow"]), frow(CF, ["Capital Expenditure"]); debt, cash = frow(BS, ["Total Debt"]), frow(BS, ["Cash Cash Equivalents And Short Term Investments", "Cash And Cash Equivalents"])
+    u, un = (1e9, "mil M") if max([abs(x).max() for x in (rev, ni, ocf) if len(x)] or [0]) >= 1e9 else (1e6, "M"); lab = lambda s_: [d_.strftime("%Y" if a else "%b %Y") for d_ in s_.index]; figs = []
+    def bars(title, ser, yl):
+        fg = go.Figure([go.Bar(x=lab(v), y=(v / u if sc else v).values, name=n, marker_color=cl) for n, v, cl, sc in ser if len(v)])
+        return fg.update_layout(title=title, barmode="group", height=320, yaxis_title=yl, margin=dict(t=46, b=10), legend=dict(orientation="h", y=1.14), paper_bgcolor="rgba(0,0,0,0)") if len(fg.data) else None
+    figs.append(bars(f"Vendas e lucro líquido GAAP ({un} {cur})", [("Vendas", rev, "#6D5BF7", 1), ("Lucro líquido", ni, UP, 1)], None))
+    if len(rev):
+        mg = go.Figure([go.Scatter(x=lab(m_), y=(m_ * 100).values, name=n, mode="lines+markers", line=dict(color=cl, width=3)) for n, m_, cl in (("Margem bruta", (gp / rev).dropna(), "#3B82F6"), ("Margem operacional", (oi / rev).dropna(), "#F59E0B"), ("Margem líquida", (ni / rev).dropna(), UP)) if len(m_)])
+        figs.append(mg.update_layout(title="Margens (%)", height=320, yaxis=dict(ticksuffix=" %"), margin=dict(t=46, b=10), legend=dict(orientation="h", y=1.14), paper_bgcolor="rgba(0,0,0,0)"))
+        yoy = rev.pct_change(1 if a else 4).dropna() * 100; fg = go.Figure(go.Bar(x=lab(yoy), y=yoy.values, marker_color=[UP if v >= 0 else DN for v in yoy.values])) if len(yoy) else None
+        figs.append(fg.update_layout(title="Crescimento das vendas " + ("ano a ano" if a else "face ao mesmo trimestre do ano anterior") + " (%)", height=320, yaxis=dict(ticksuffix=" %"), margin=dict(t=46, b=10), paper_bgcolor="rgba(0,0,0,0)") if fg else None)
+    figs.append(bars("Lucro por ação diluído (EPS)", [("EPS", eps, "#6D5BF7", 0)], None)); figs.append(bars(f"Fluxo de caixa ({un} {cur})", [("Operacional", ocf, "#3B82F6", 1), ("Livre (FCF)", fcf, UP, 1), ("Investimento (capex)", cap, DN, 1)], None))
+    figs.append(bars(f"Dívida vs caixa ({un} {cur})", [("Dívida total", debt, DN, 1), ("Caixa", cash, UP, 1)], None))
+    return [f for f in figs if f is not None]
+
 @st.dialog("Detalhe do ativo", width="large")
 def detail(tk):
     sym = S["ymap"].get(tk, tk); txs = [t for t in S["tx"] if t["tk"] == tk]
@@ -283,7 +359,8 @@ def detail(tk):
     if len(d) < 3: st.warning("Poucos dados neste período."); return
     c = d["Close"]; r = c.pct_change().dropna(); dd = c / c.cummax() - 1; i = info(sym)
     is_etf = i.get("quoteType") == "ETF" or tk in LOOK
-    tt = st.tabs(["Estatísticas", "Gráficos", "Previsão", "Dados"] + (["Composição"] if is_etf else [])); t_stats, t_graf, t_prev, t_dados = tt[:4]
+    labs = ["Estatísticas"] + (["Fundamentais", "Financeiros"] if not is_etf else []) + ["Gráficos", "Previsão", "Dados"] + (["Composição"] if is_etf else []); T_ = dict(zip(labs, st.tabs(labs)))
+    t_stats, t_graf, t_prev, t_dados = T_["Estatísticas"], T_["Gráficos"], T_["Previsão"], T_["Dados"]
     with t_stats:
         k = st.columns(4); k[0].metric(f"Preço ({cur})", f"{c.iloc[-1]:,.2f}"); k[1].metric(f"Retorno ({per})", f"{(c.iloc[-1]/c.iloc[0]-1)*100:+.2f} %")
         k[2].metric("Máximo / Mínimo", f"{c.max():,.2f} / {c.min():,.2f}"); k[3].metric("Volatilidade anual", f"{r.std()*np.sqrt(252)*100:.1f} %")
@@ -321,8 +398,37 @@ def detail(tk):
     with t_dados:
         st.dataframe(d[["Open", "High", "Low", "Close", "Volume"]].sort_index(ascending=False).style.format("{:,.2f}", subset=["Open", "High", "Low", "Close"]), width="stretch", height=300)
         if txs: st.markdown("**As minhas transações**"); st.dataframe(pd.DataFrame(txs).drop(columns=["id", "bid"], errors="ignore").sort_values("date", ascending=False), hide_index=True, width="stretch")
+    if not is_etf:
+        with T_["Fundamentais"]:
+            if not i: st.warning("O Yahoo não devolveu os fundamentais deste ativo agora. Tenta de novo dentro de uns minutos.")
+            else:
+                st.markdown(f"**{i.get('longName') or tk}**  ·  " + " · ".join(str(x) for x in (i.get("sector"), i.get("industry"), i.get("country")) if x) + (f"  ·  [{i['website']}]({i['website']})" if i.get("website") else ""))
+                try: st.markdown(snap_html(snap_items(i, h)), unsafe_allow_html=True)
+                except Exception as e_: st.info("Não consegui calcular a tabela completa para este ativo.")
+                FD = fin_data(sym); a_, b_ = st.columns(2); pt, rc, ed = FD.get("pt"), FD.get("rec"), FD.get("ed")
+                if isinstance(pt, dict) and pt.get("mean"):
+                    fg = go.Figure(go.Bar(x=[pt.get(k) for k in ("low", "mean", "high")], y=["Mínimo", "Médio", "Máximo"], orientation="h", marker_color=["#94A3B8", "#6D5BF7", "#94A3B8"])); fg.add_vline(x=pt.get("current") or float(h["Close"].dropna().iloc[-1]), line_dash="dash", annotation_text="preço atual")
+                    a_.plotly_chart(fg.update_layout(title=f"Preço-alvo dos analistas ({cur})", height=300, margin=dict(t=46, b=10), paper_bgcolor="rgba(0,0,0,0)"), width="stretch")
+                if rc is not None and len(rc):
+                    r0 = rc.iloc[0]; cats = [("strongBuy", "Compra forte", UP), ("buy", "Compra", "#84CC16"), ("hold", "Manter", "#94A3B8"), ("sell", "Venda", "#F97316"), ("strongSell", "Venda forte", DN)]
+                    b_.plotly_chart(go.Figure(go.Bar(x=[n for k, n, _ in cats], y=[float(r0.get(k, 0)) for k, _, _ in cats], marker_color=[c_ for _, _, c_ in cats])).update_layout(title="Recomendações dos analistas", height=300, margin=dict(t=46, b=10), paper_bgcolor="rgba(0,0,0,0)"), width="stretch")
+                if ed is not None and len(ed) and "Reported EPS" in ed:
+                    e_ = ed.dropna(subset=["Reported EPS"]).sort_index().tail(8)
+                    if len(e_): st.plotly_chart(go.Figure([go.Bar(x=[d_.strftime("%b %Y") for d_ in e_.index], y=e_["EPS Estimate"], name="Estimativa", marker_color="#94A3B8"), go.Bar(x=[d_.strftime("%b %Y") for d_ in e_.index], y=e_["Reported EPS"], name="Reportado", marker_color=UP)]).update_layout(title="Resultados: EPS estimado vs reportado", barmode="group", height=320, margin=dict(t=46, b=10), legend=dict(orientation="h", y=1.14), paper_bgcolor="rgba(0,0,0,0)"), width="stretch")
+                st.caption("Campos do estilo Finviz calculados com dados do Yahoo Finance (podem diferir ligeiramente do Finviz). '-' = o Yahoo não tem esse dado.")
+        with T_["Financeiros"]:
+            per_f = st.radio("Período", ["Anual", "Trimestral"], horizontal=True, key="fin_per"); FD = fin_data(sym)
+            if not any(FD.get(k) is not None for k in ("ia", "iq", "cfa", "bsa")): st.warning("O Yahoo não devolveu as demonstrações financeiras deste ativo agora.")
+            else:
+                gs = fin_charts(FD, per_f, i.get("financialCurrency") or cur or "")
+                for k in range(0, len(gs), 2):
+                    for col_, fg in zip(st.columns(2), gs[k:k + 2]): col_.plotly_chart(fg, width="stretch")
+                with st.expander("Demonstração de resultados (valores em milhares)"):
+                    I_ = FD.get("ia" if per_f == "Anual" else "iq")
+                    if I_ is not None: st.dataframe((I_ / 1e3).round(0).style.format("{:,.0f}", na_rep="—"), width="stretch")
+                st.caption("Valores GAAP do Yahoo Finance (4 anos ou ~5 trimestres, conforme o Yahoo disponibiliza).")
     if is_etf:
-        with tt[4]:
+        with T_["Composição"]:
             lt = lookthrough(tk)
             if not lt: st.info("O Yahoo não tem a composição deste ETF.")
             else:
