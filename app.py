@@ -6,6 +6,7 @@ from itertools import groupby
 import concurrent.futures as cf
 
 st.set_page_config(page_title="Painel Financeiro", page_icon="📈", layout="wide")
+if "dark" not in st.session_state: st.session_state["dark"] = st.query_params.get("tema") == "escuro"  # o tema guarda-se no endereço (?tema=escuro)
 PIE_COL = {"Quantum": "#7C5CFF", "Alone Stocks": "#0FB5A6", "Daily Dividend": "#F59E0B", "ETFs": "#3B82F6", "Sem pie": "#64748B"}
 CAT_COL = {"Restaurantes": "#F97316", "Supermercado": "#84CC16", "Subscrições": "#A855F7", "Transportes": "#06B6D4", "Lazer": "#EC4899", "Saúde": "#EF4444", "Material Escolar": "#3B82F6", "Investido": "#F59E0B", "Outros": "#94A3B8"}
 EXTRA = ["#EC4899", "#84CC16", "#06B6D4", "#F97316", "#A855F7", "#64748B", "#EF4444"]
@@ -24,8 +25,8 @@ st.markdown("""<style>
 @import url('https://fonts.googleapis.com/css2?family=Manrope:wght@400;600;800&display=swap');
 html,body,.stApp,.stApp p,.stApp label,.stApp button,.stApp input,.stApp textarea,.stApp li,.stApp h1,.stApp h2,.stApp h3,.stApp h4,[data-testid="stMarkdownContainer"]{font-family:'Manrope',system-ui,sans-serif}
 [data-testid="stIconMaterial"],.material-icons,.material-symbols-rounded{font-family:'Material Symbols Rounded','Material Icons'!important}
-.block-container{padding-top:1.1rem;max-width:1250px}
-.brand{font-weight:800;font-size:1.6rem;color:#14142B;letter-spacing:-.02em}
+.block-container{padding-top:3.8rem;max-width:1250px}
+.brand{font-weight:800;font-size:1.6rem;line-height:1.4;color:#14142B;letter-spacing:-.02em;margin-bottom:.3rem}
 .hero{background:#14142B;color:#fff;border-radius:22px;padding:22px 26px;margin:8px 0 14px}
 .hero small{color:#A9A8C8;font-weight:600}.hero .big{font-size:2.7rem;font-weight:800;letter-spacing:-.025em;line-height:1.1;margin:2px 0 10px}
 .chip{display:inline-block;padding:3px 11px;border-radius:99px;font-weight:700;font-size:.82rem;margin:2px 6px 2px 0}
@@ -41,6 +42,8 @@ div[data-testid="stMetric"]{background:#fff;border-radius:14px;padding:10px 14px
 div[data-testid="stExpander"]{background:#fff;border-radius:14px;border:0;box-shadow:0 1px 4px rgba(20,20,43,.07)}
 .stButton>button,.stDownloadButton>button{border-radius:12px;font-weight:700}
 </style>""", unsafe_allow_html=True)
+if st.session_state.get("dark"):  # tema escuro: inverte a página toda (o painel escuro e as imagens voltam a inverter para manterem o aspeto)
+    st.markdown("""<style>html{filter:invert(.9) hue-rotate(180deg)}.hero,img,[data-testid="stImage"]{filter:invert(.9) hue-rotate(180deg)}</style>""", unsafe_allow_html=True)
 
 MES = ["Janeiro","Fevereiro","Março","Abril","Maio","Junho","Julho","Agosto","Setembro","Outubro","Novembro","Dezembro"]
 
@@ -673,17 +676,16 @@ with t1:
         if pie_f != "Todas": st.markdown(f'<span class="chip nt">{pie_f}</span>{chip(V - C, f"{num(V)} €  ·  {num(V - C, 2, True)} €  ·  {num((V / C - 1) * 100 if C else 0, 2, True)} %")}', unsafe_allow_html=True)
         scope = [t for t in S["tx"] if (t["pie"] == pie_f if pie_f != "Todas" and grp.startswith("Sep") else t["pie"] in open_pies)]; col = pcol(pie_f) if pie_f != "Todas" else "#6D5BF7"
         with st.spinner("A calcular estatísticas..."): ps = pie_stats(tl_of("sel:" + pie_f, scope), scope)
-        k = st.columns(4); dcol = lambda v: UP if v >= 0 else DN; big = df.iloc[0]
-        k[0].markdown(card("Valor atual", num(V) + " €", chip(V - C, f"{num(V - C, 2, True)} €  ·  {num((V / C - 1) * 100 if C else 0, 2, True)} %"), col), unsafe_allow_html=True)
-        k[1].markdown(card("Valor investido", num(C) + " €", f'<span class="chip nt">{len(df)} posições</span>', col), unsafe_allow_html=True)
+        dcol = lambda v: UP if v >= 0 else DN; big = df.iloc[0]; dt_ = lambda d_: f'<span class="chip nt">{d_.day}/{d_.month}/{d_.year}</span>'; items = []
+        if pie_f != "Todas":  # numa pie escolhida mostra o valor e o investido dela; com "Todas" já estão no painel de cima
+            items += [("Valor atual", num(V) + " €", chip(V - C, f"{num(V - C, 2, True)} €  ·  {num((V / C - 1) * 100 if C else 0, 2, True)} %"), col), ("Valor investido", num(C) + " €", f'<span class="chip nt">{len(df)} posições</span>', col)]
         if ps:
-            k[2].markdown(card("Variação do dia", num(ps["last"], 2, True) + " %", chip(ps["chg"], num(ps["chg"], 2, True) + " €"), dcol(ps["last"])), unsafe_allow_html=True)
-            k[3].markdown(card("Máx. drawdown", num(ps["mdd"], 2) + " %", f'<span class="chip nt">atual {num(ps["cur_dd"], 2)} %</span>', DN), unsafe_allow_html=True)
-            k = st.columns(4); dt_ = lambda d_: f'<span class="chip nt">{d_.day}/{d_.month}/{d_.year}</span>'
-            k[0].markdown(card("Melhor dia", num(ps["best"][1], 2, True) + " %", dt_(ps["best"][0]), UP), unsafe_allow_html=True)
-            k[1].markdown(card("Pior dia", num(ps["worst"][1], 2, True) + " %", dt_(ps["worst"][0]), DN), unsafe_allow_html=True)
-            k[2].markdown(card("Volatilidade anual", num(ps["vol"], 1) + " %", '<span class="chip nt">oscilação diária × √252</span>', col), unsafe_allow_html=True)
-            k[3].markdown(card("Maior posição", big["Ativo"], f'<span class="chip nt">{num(big["Valor €"] / V * 100 if V else 0, 1)} % da {"pie" if pie_f != "Todas" else "carteira"}</span>', col), unsafe_allow_html=True)
+            items += [("Variação do dia", num(ps["last"], 2, True) + " %", chip(ps["chg"], num(ps["chg"], 2, True) + " €"), dcol(ps["last"])), ("Máx. drawdown", num(ps["mdd"], 2) + " %", f'<span class="chip nt">atual {num(ps["cur_dd"], 2)} %</span>', DN),
+                ("Melhor dia", num(ps["best"][1], 2, True) + " %", dt_(ps["best"][0]), UP), ("Pior dia", num(ps["worst"][1], 2, True) + " %", dt_(ps["worst"][0]), DN),
+                ("Volatilidade anual", num(ps["vol"], 1) + " %", '<span class="chip nt">oscilação diária × √252</span>', col), ("Maior posição", big["Ativo"], f'<span class="chip nt">{num(big["Valor €"] / V * 100 if V else 0, 1)} % da {"pie" if pie_f != "Todas" else "carteira"}</span>', col)]
+        n_ = 4 if pie_f != "Todas" else 3
+        for i_ in range(0, len(items), n_):
+            for c_, it_ in zip(st.columns(n_), items[i_:i_ + n_]): c_.markdown(card(*it_), unsafe_allow_html=True)
         a, b = st.columns([1, 2])
         if pie_f != "Todas" and grp.startswith("Sep"):
             g = df.groupby("Ativo")["Valor €"].sum().sort_values(ascending=False)
@@ -1093,7 +1095,7 @@ with t_rad:
 Todas as médias são ponderadas pelo valor de cada posição, só com as posições que têm dados, e a tabela mostra a cobertura. Os fundamentais vêm do Yahoo Finance (podem estar atrasados ou em falta, sobretudo em ETFs) e são uma fotografia de hoje, não histórico. Não é aconselhamento financeiro.""")
 
 with top:
-    b1, b2, b3, b4, b5, _ = st.columns([1.1, 1.3, 0.9, 1.6, 2.2, 0.7]); b4.toggle("Pré/pós-mercado", value=True, key="ext_on"); b5.toggle("Custo ao câmbio da compra", value=True, key="cost_hist")
+    b1, b2, b3, b4, b5, b6, _ = st.columns([1.1, 1.3, 0.9, 1.5, 2.0, 1.4, 0.3]); b6.toggle("🌙 Tema escuro", key="dark", on_change=lambda: st.query_params.update({"tema": "escuro" if st.session_state["dark"] else "claro"})); b4.toggle("Pré/pós-mercado", value=True, key="ext_on"); b5.toggle("Custo ao câmbio da compra", value=True, key="cost_hist")
     if b1.button("➕ Transação", type="primary", width="stretch"): dlg_add()
     if b2.button("📥 Importar CSV", width="stretch"): dlg_imp()
     if b3.button("🔄 Preços", width="stretch"): st.cache_data.clear(); st.rerun()
