@@ -105,24 +105,48 @@ def rate_of(c, fb=1.0):
     """Câmbio atual para €: manual (se definido) > Yahoo ao vivo > último guardado."""
     return 1.0 if c == "EUR" else (S.get("fxman", {}).get(c) or fx_live(c) or S["fx"].get(c) or fb)
 
-@st.cache_data(ttl=300)
-def ext_prices(syms):
-    """Último preço em barras de 1 minuto incl. pré e pós-mercado (ações dos EUA): {símbolo: (preço, 'Pré'|'Sessão'|'Pós', hora)}."""
-    us = [x for x in syms if "." not in x and "=" not in x and not x.startswith("^")]; out = {}
-    if not us: return out
+def _ext1(sym):
+    """Cotação fora de horas pelo Yahoo (campos do info): marketState + preMarketPrice / postMarketPrice."""
     try:
-        d = yf.download(us, period="2d", interval="1m", prepost=True, progress=False, group_by="column", threads=True)["Close"]
-        if isinstance(d, pd.Series): d = d.to_frame(us[0])
-        now = pd.Timestamp.now(tz="America/New_York")
-        for c in d.columns:
-            x = d[c].dropna()
-            if x.empty: continue
-            ts = x.index[-1]; ts = ts.tz_localize("UTC") if ts.tzinfo is None else ts; ts = ts.tz_convert("America/New_York")
-            if now - ts > pd.Timedelta(days=4): continue
-            m = ts.hour * 60 + ts.minute; out[c] = (float(x.iloc[-1]), "Pré" if m < 570 else "Sessão" if m < 960 else "Pós", ts.strftime("%d/%m %H:%M"), ts.date())
+        i = yf.Ticker(sym).info or {}; stt = str(i.get("marketState") or "").upper(); reg = i.get("regularMarketPrice") or i.get("currentPrice")
+        pre, post, tp, tq, tr = i.get("preMarketPrice"), i.get("postMarketPrice"), i.get("preMarketTime"), i.get("postMarketTime"), i.get("regularMarketTime"); pk = None
+        if stt in ("PRE",) and isn(pre): pk = (pre, "Pré", tp)
+        elif stt in ("POST", "POSTPOST", "CLOSED", "PREPRE") and isn(post) and (tr is None or (tq or 0) >= tr): pk = (post, "Pós", tq)
+        elif stt == "REGULAR" and isn(reg): pk = (reg, "Sessão", tr)
+        if pk:
+            ts = pd.Timestamp(pk[2], unit="s", tz="UTC").tz_convert("America/New_York") if pk[2] else pd.Timestamp.now(tz="America/New_York")
+            return (float(pk[0]), pk[1], ts.strftime("%d/%m %H:%M"), ts.date(), "Yahoo (info)")
     except Exception:
         pass
+    return None
+
+@st.cache_data(ttl=300)
+def _ext_cached(syms):
+    us = [x for x in syms if "." not in x and "=" not in x and not x.startswith("^")]; out = {}
+    if not us: return out
+    with cf.ThreadPoolExecutor(6) as ex:
+        for sy, r in zip(us, ex.map(_ext1, us)):
+            if r: out[sy] = r
+    miss = [x for x in us if x not in out]  # sem info: tenta as barras de 1 minuto (com pré/pós)
+    if miss:
+        try:
+            d = yf.download(miss, period="2d", interval="1m", prepost=True, progress=False, group_by="column", threads=True)["Close"]
+            if isinstance(d, pd.Series): d = d.to_frame(miss[0])
+            now = pd.Timestamp.now(tz="America/New_York")
+            for c in d.columns:
+                x = d[c].dropna()
+                if x.empty: continue
+                ts = x.index[-1]; ts = ts.tz_localize("UTC") if ts.tzinfo is None else ts; ts = ts.tz_convert("America/New_York")
+                if now - ts > pd.Timedelta(days=4): continue
+                m = ts.hour * 60 + ts.minute; out[c] = (float(x.iloc[-1]), "Pré" if m < 570 else "Sessão" if m < 960 else "Pós", ts.strftime("%d/%m %H:%M"), ts.date(), "barras 1m")
+        except Exception:
+            pass
     return out
+
+def ext_prices(syms):
+    r = _ext_cached(syms)
+    if syms and not r: _ext_cached.clear()  # não guardar falhas
+    return r
 
 def positions(group):
     m, last = {}, {}
@@ -141,16 +165,16 @@ def positions(group):
         if p["Qtd"] <= 1e-9: continue
         l = last[p["Ativo"]]; sy = S["ymap"].get(p["Ativo"], p["Ativo"])
         price, cur = quote(sy)
-        live = price is not None; src = "ao vivo" if live else "último preço"; fh = 0.0
+        live = price is not None; src = "ao vivo" if live else "último preço"; fh = 0.0; hora = ""
         if live and cur == "USD" and EXT.get(sy):
             e = EXT[sy]
-            if e[1] in ("Pré", "Pós"): fh = (e[0] / price - 1) * 100; src = "pré-mercado" if e[1] == "Pré" else "pós-mercado"
+            if e[1] in ("Pré", "Pós"): fh = (e[0] / price - 1) * 100; src = "pré-mercado" if e[1] == "Pré" else "pós-mercado"; hora = e[2]
             price = e[0]
         if not live: price, cur = S["px"].get(p["Ativo"], l["price"]), l["cur"]
         val = p["Qtd"] * price * rate_of(cur, l["fx"]); custo = p["CN"] * rate_of(l["cur"], l["fx"])  # custo = qtd x preço de compra, convertido ao câmbio atual
         out.append({"Ativo": p["Ativo"], "Pie": p["Pie"] if group == "pie" else ", ".join(sorted(p["pies"])), "Moeda": cur, "Qtd": p["Qtd"],
             "Preço": price, "Custo €": custo, "Valor €": val, "L/P €": val - custo, "L/P %": (val / custo - 1) * 100 if custo else 0,
-            "Fonte": src, "Fora de horas %": fh})
+            "Fonte": src, "Fora de horas %": fh, "Hora (ET)": hora})
     df = pd.DataFrame(out)
     if not df.empty: df["Peso %"] = df["Valor €"] / df["Valor €"].sum() * 100
     return df.sort_values("Valor €", ascending=False) if not df.empty else df
@@ -668,6 +692,16 @@ with t1:
             tk_sel = df.iloc[rows[0]]["Ativo"]
             if st.button(f"📊 Abrir detalhe de {tk_sel}") or st.session_state.get("opened") != tk_sel: st.session_state.opened = tk_sel; detail(tk_sel)
         else: st.session_state.opened = None
+        with st.expander("🔎 Diagnóstico das cotações fora de horas"):
+            if not st.session_state.get("ext_on", True): st.info("O interruptor Pré/pós-mercado (no topo) está desligado.")
+            else:
+                sy_l = sorted({S["ymap"].get(t, t) for t in df["Ativo"]}); E = ext_prices(tuple(sy_l)); dg = []
+                for sy in sy_l:
+                    if "." in sy or "=" in sy: continue
+                    e = E.get(sy); reg = quote(sy)[0]
+                    dg.append({"Símbolo": sy, "Sessão regular": reg, "Fora de horas": e[0] if e else None, "Estado": e[1] if e else "sem cotação", "Hora (ET)": e[2] if e else "", "Fonte": e[4] if e else "", "Dif. %": (e[0] / reg - 1) * 100 if e and reg else None})
+                st.dataframe(pd.DataFrame(dg).style.format({"Sessão regular": "{:.2f}", "Fora de horas": "{:.2f}", "Dif. %": "{:+.2f}"}, na_rep="—"), hide_index=True, width="stretch")
+                st.caption(f"{sum(1 for x in dg if x['Estado'] != 'sem cotação')} de {len(dg)} ações dos EUA com cotação. As europeias não têm pré/pós-mercado. Se uma ação aparece 'sem cotação' ou com hora antiga, o Yahoo não tem negociação recente fora de horas para ela.")
         st.caption("Clica numa linha para abrir o detalhe do ativo (estatísticas, gráficos, previsão e dados).")
         st.caption("“ao vivo” = cotação do Yahoo Finance (atualiza de 15 em 15 min); “último preço” = não encontrei o símbolo, uso o último preço de compra. Corrige os símbolos em Transações.")
         st.subheader("Evolução: valor atual vs valor investido")
