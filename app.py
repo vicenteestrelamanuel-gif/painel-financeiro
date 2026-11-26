@@ -156,9 +156,9 @@ def ext_prices(syms):
 def positions(group):
     m, last, ACC = {}, {}, {}  # ACC: quantidade e custo (€, câmbio de cada compra) por ativo, somando todas as pies
     for t in sorted(S["tx"], key=lambda t: t["date"]):
-        last[t["tk"]] = t; ac = ACC.setdefault(t["tk"], [0.0, 0.0])
-        if t["type"] == "Compra": ac[0] += t["qty"]; ac[1] += t["qty"] * t["price"] * t["fx"]
-        else: g = min(1, t["qty"] / ac[0]) if ac[0] > 0 else 0; ac[1] -= ac[1] * g; ac[0] -= t["qty"]
+        last[t["tk"]] = t; ac = ACC.setdefault(t["tk"], [0.0, 0.0, 0.0])
+        if t["type"] == "Compra": ac[0] += t["qty"]; ac[1] += t["qty"] * t["price"] * t["fx"]; ac[2] += t["qty"] * t["price"]
+        else: g = min(1, t["qty"] / ac[0]) if ac[0] > 0 else 0; ac[1] -= ac[1] * g; ac[2] -= ac[2] * g; ac[0] -= t["qty"]
         p = m.setdefault((t["pie"] if group == "pie" else "—", t["tk"]), dict(Pie=t["pie"] if group == "pie" else "—", Ativo=t["tk"], Qtd=0.0, Custo=0.0, CN=0.0, pies=set()))
         p["pies"].add(t["pie"])
         if t["type"] == "Compra":
@@ -181,7 +181,8 @@ def positions(group):
         val = p["Qtd"] * price * rate_of(cur, l["fx"]); custo = (p["Qtd"] * ACC[p["Ativo"]][1] / ACC[p["Ativo"]][0] if ACC[p["Ativo"]][0] > 1e-9 else 0.0) if st.session_state.get("cost_hist", True) else p["CN"] * rate_of(l["cur"], l["fx"])  # custo médio da conta (por ativo) ao câmbio de cada compra (como a Trading 212) ou, desligado, qtd x preço de compra ao câmbio atual
         out.append({"Ativo": p["Ativo"], "Pie": p["Pie"] if group == "pie" else ", ".join(sorted(p["pies"])), "Moeda": cur, "Qtd": p["Qtd"],
             "Preço": price, "Custo €": custo, "Valor €": val, "L/P €": val - custo, "L/P %": (val / custo - 1) * 100 if custo else 0,
-            "Fonte": src, "Fora de horas %": fh, "Hora (ET)": hora})
+            "Fonte": src, "Fora de horas %": fh, "Hora (ET)": hora,
+            "Preço médio": ACC[p["Ativo"]][2] / ACC[p["Ativo"]][0] if ACC[p["Ativo"]][0] > 1e-9 else np.nan, "Moeda compra": l["cur"], "Preço médio €": ACC[p["Ativo"]][1] / ACC[p["Ativo"]][0] if ACC[p["Ativo"]][0] > 1e-9 else np.nan})
     df = pd.DataFrame(out)
     if not df.empty: df["Peso %"] = df["Valor €"] / df["Valor €"].sum() * 100
     return df.sort_values("Valor €", ascending=False) if not df.empty else df
@@ -606,7 +607,7 @@ def _fund1(sym):
     try:
         t = yf.Ticker(sym); i = t.info or {}
         if not i.get("quoteType"): return {}
-        out = {k: i.get(k) for k in ("quoteType", "sector", "revenueGrowth", "earningsGrowth", "forwardPE", "trailingPE", "debtToEquity", "currentRatio")}
+        out = {k: i.get(k) for k in ("quoteType", "sector", "industry", "country", "revenueGrowth", "earningsGrowth", "forwardPE", "trailingPE", "debtToEquity", "currentRatio")}
         try:
             dv = t.dividends; dv.index = dv.index.tz_localize(None)
             out["div12"] = float(dv[dv.index >= pd.Timestamp.today() - pd.Timedelta(days=365)].sum()) / (100 if sym.endswith(".L") else 1)
@@ -616,10 +617,10 @@ def _fund1(sym):
         return {}
 
 @st.cache_resource
-def _fund_store(): return {}  # símbolo -> (hora, dados); os sucessos ficam guardados e só se repetem os que falharam
+def _fund_store_v2(): return {}  # símbolo -> (hora, dados); os sucessos ficam guardados e só se repetem os que falharam
 
 def fund_all(syms, force=False):
-    store = _fund_store(); now = time.time()
+    store = _fund_store_v2(); now = time.time()
     todo = [x for x in syms if force and not (store.get(x) or (0, {}))[1] or x not in store or now - store[x][0] > (21600 if store[x][1] else 600)]
     def job(sym):
         for k in range(2):
@@ -709,6 +710,47 @@ def lookthrough(tk):
     if (not c or not c["top"]) and tk in LOOK: c = etf_comp(LOOK[tk]); prox = True; used = LOOK[tk]
     return dict(top=c["top"], sectors=c["sectors"], proxy=prox, sym=used) if c and c["top"] else None
 
+def get_LT(dfa, F):
+    """Composição (look-through) dos ETFs que a têm, por ticker."""
+    out = {}
+    for tk in dfa["Ativo"].unique():
+        if (F.get(S["ymap"].get(tk, tk)) or {}).get("quoteType") == "ETF" or tk in LOOK:
+            lt = lookthrough(tk)
+            if lt: out[tk] = lt
+    return out
+
+DIMS = {"Setor": "#7C5CFF", "Indústria": "#0FB5A6", "País": "#F59E0B", "Moeda": "#3B82F6"}
+
+def exposure(sub, F, LT, dim):
+    """Valor em € por setor / indústria / país / moeda. Setor dos ETFs: repartido pela composição do ETF. Indústria e país dos ETFs: sem detalhe no Yahoo."""
+    acc = {}
+    def add(k, v): acc[k] = acc.get(k, 0.0) + v
+    for _, r in sub.iterrows():
+        v = float(r["Valor €"]); tk = r["Ativo"]; f = F.get(S["ymap"].get(tk, tk)) or {}
+        if dim == "Moeda": add(r["Moeda"] or "Sem dados", v); continue
+        if f.get("quoteType") == "ETF" or tk in LOOK:
+            lt = LT.get(tk); ss = sum(lt["sectors"].values()) if lt else 0
+            if dim == "Setor" and ss > 0:
+                for k_, w_ in lt["sectors"].items(): add(k_, v * w_ / ss)
+            else: add("ETF (sem detalhe)", v)
+            continue
+        add(f.get({"Setor": "sector", "Indústria": "industry", "País": "country"}[dim]) or "Sem dados", v)
+    s_ = pd.Series(acc, dtype=float).sort_values(ascending=False); tot = s_.sum()
+    return pd.DataFrame({dim: s_.index, "Valor €": s_.values, "Peso %": s_.values / tot * 100 if tot else 0.0})
+
+def exp_chart(E, dim, color):
+    d = E.copy()
+    if len(d) > 12: d = pd.concat([d.head(11), pd.DataFrame({dim: [f"Outros ({len(d) - 11})"], "Valor €": [d.iloc[11:]["Valor €"].sum()], "Peso %": [d.iloc[11:]["Peso %"].sum()]})], ignore_index=True)
+    d = d.iloc[::-1].copy(); d["t"] = d["Peso %"].map(lambda x: f"{num(x, 1)} %")
+    fig = px.bar(d, x="Peso %", y=dim, orientation="h", text="t", custom_data=["Valor €"])
+    fig.update_traces(marker_color=color, textposition="outside", cliponaxis=False, hovertemplate="%{y}<br>%{x:.1f} %<br>%{customdata[0]:,.2f} €<extra></extra>")
+    return fig.update_layout(height=max(260, 36 * len(d) + 60), margin=dict(t=10, b=10, l=10, r=50), xaxis=dict(title=None, range=[0, max(d["Peso %"].max() * 1.18, 5)], showgrid=False, visible=False), yaxis=dict(title=None), paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
+
+def exp_pivot(dfa, F, LT, dim, pies):
+    X = pd.DataFrame({p: exposure(dfa[dfa["Pie"] == p], F, LT, dim).set_index(dim)["Peso %"] for p in pies})
+    X.insert(0, "Carteira", exposure(dfa, F, LT, dim).set_index(dim)["Peso %"])
+    return X.sort_values("Carteira", ascending=False).reset_index().rename(columns={"index": dim})
+
 def day_changes(syms):
     """Variação do dia (%) por símbolo: preço atual (com pré/pós-mercado, se ligado) face ao fecho anterior."""
     syms = tuple(sorted(set(syms))); C = closes(syms); out = {}
@@ -753,6 +795,11 @@ def recon_table(c, P_):
     R = pd.DataFrame(rows); R["Δ preço %"] = (R["Preço app €"] / R["Preço T212 €"] - 1) * 100
     return R
 
+def pie_csv(dfa, pie):
+    """CSV de uma pie: ticker, nº de ações e preço médio de compra (na moeda da compra, e em euros)."""
+    d = dfa[dfa["Pie"] == pie].sort_values("Valor €", ascending=False)
+    return pd.DataFrame({"ticker": d["Ativo"], "shares": d["Qtd"].round(8), "avg_price": d["Preço médio"].round(4), "currency": d["Moeda compra"], "avg_price_eur": d["Preço médio €"].round(4)}).to_csv(index=False).encode("utf-8")
+
 def parse_csv(f):
     d = pd.read_csv(f); d = d[d["Action"].str.contains("buy|sell", case=False, na=False)]; rows = []
     d["_ts"] = pd.to_datetime(d["Time (UTC)"], utc=True).astype("int64") / 1e9
@@ -772,7 +819,7 @@ def parse_csv(f):
 
 st.markdown('<div class="brand">📈 Painel Financeiro</div>', unsafe_allow_html=True)
 top = st.container()
-t1, t_rad, t_day, t_div, t_cal, t2, t3 = st.tabs(["Portfólio", "Radar", "Resumo do dia", "Dividendos", "Calendário", "Transações", "Despesas"])
+t1, t_rad, t_exp, t_day, t_div, t_cal, t2, t3 = st.tabs(["Portfólio", "Radar", "Exposição", "Resumo do dia", "Dividendos", "Calendário", "Transações", "Despesas"])
 
 # ================= PORTFÓLIO =================
 with t1:
@@ -786,6 +833,7 @@ with t1:
             cols = st.columns(4)
             for col, (p, r) in zip(cols, list(gp.iterrows())[i:i + 4]):
                 col.markdown(card(p, num(r.v) + " €", chip(r.v - r.c, f"{num(r.v - r.c, 2, True)} € · {num((r.v / r.c - 1) * 100 if r.c else 0, 1, True)} %"), pcol(p), r.v / VA * 100), unsafe_allow_html=True)
+                col.download_button("⬇️ CSV da pie", pie_csv(dfa, p), file_name=f"{p.replace(' ', '_')}_{dt.date.today()}.csv", mime="text/csv", key=f"dl_{p}", width="stretch")
     c1, c2 = st.columns([4, 1.5])
     grp = c2.selectbox("Vista", ["Separar por pie", "Agregar por ação"], label_visibility="collapsed")
     open_pies = [p for p in S["pies"] if not dfa.empty and p in set(dfa["Pie"])]
@@ -1217,6 +1265,31 @@ with t_rad:
 | **Diversificação** | posições efetivas 1/Σw² (40 %), setores efetivos (30 %) e correlação média ponderada entre posições nos últimos 12 meses (30 %). Os ETFs são vistos por dentro: as maiores posições de cada um contam como posições próprias, o resto conta como linhas de 1 %, e os setores vêm da composição do ETF | 1 posição, 1 setor, correlação 0,8 | 25 posições, 8 setores, correlação 0,2 |
 
 Todas as médias são ponderadas pelo valor de cada posição, só com as posições que têm dados, e a tabela mostra a cobertura. Os fundamentais vêm do Yahoo Finance (podem estar atrasados ou em falta, sobretudo em ETFs) e são uma fotografia de hoje, não histórico. Não é aconselhamento financeiro.""")
+
+with t_exp:
+    dfa = positions("pie")
+    if dfa.empty: st.info("Sem posições abertas.")
+    else:
+        pies_e = [p for p in S["pies"] if p in set(dfa["Pie"])]
+        pick_e = st.pills("Âmbito", ["Carteira toda"] + pies_e, default="Carteira toda", key="exp_pie", label_visibility="collapsed") or "Carteira toda"
+        syms = tuple(sorted({S["ymap"].get(t, t) for t in dfa["Ativo"]}))
+        with st.spinner("A recolher setor, indústria e país (a primeira vez demora)..."): F = fund_all(syms)
+        n_ok = sum(1 for v in F.values() if v.get("quoteType")); c_a, c_b = st.columns([4, 1])
+        (c_a.warning if n_ok < len(syms) * 0.6 else c_a.caption)(f"Dados obtidos para {n_ok} de {len(syms)} ativos." + ("" if n_ok >= len(syms) * 0.6 else " O Yahoo não respondeu aos restantes; ficam como 'Sem dados'. Espera uns minutos e tenta de novo."))
+        if c_b.button("🔁 Tentar de novo", key="exp_retry"): F = fund_all(syms, force=True); st.rerun()
+        LT = get_LT(dfa, F); sub = dfa if pick_e == "Carteira toda" else dfa[dfa["Pie"] == pick_e]
+        E = {d: exposure(sub, F, LT, d) for d in DIMS}
+        for c_, (d, col_) in zip(st.columns(4), DIMS.items()):
+            t0 = E[d].iloc[0]; c_.markdown(card(f"{d} principal", t0[d], f'<span class="chip nt">{num(t0["Peso %"], 1)} % · {len(E[d])} no total</span>', col_, t0["Peso %"]), unsafe_allow_html=True)
+        for tab_, (d, col_) in zip(st.tabs(list(DIMS)), DIMS.items()):
+            with tab_:
+                a, b = st.columns([3, 2]); a.plotly_chart(exp_chart(E[d], d, col_), width="stretch", key=f"exp_ch_{d}")
+                b.dataframe(E[d].style.format({"Valor €": "{:.2f}", "Peso %": "{:.1f}"}), hide_index=True, width="stretch", height=min(520, 38 * len(E[d]) + 40), column_config={"Peso %": st.column_config.ProgressColumn("Peso", format="%.1f%%", min_value=0, max_value=100)})
+                if pick_e == "Carteira toda" and len(pies_e) > 1:
+                    with st.expander(f"Comparar pies · {d}"):
+                        X = exp_pivot(dfa, F, LT, d, pies_e); st.dataframe(X.style.format({c: "{:.1f}" for c in X.columns[1:]}, na_rep="—"), hide_index=True, width="stretch")
+                        st.caption("Percentagem do valor de cada pie (a coluna 'Carteira' é sobre o total).")
+        st.caption("Pesos calculados pelo valor atual em €. Setor, indústria e país vêm do Yahoo Finance (o país é o da sede da empresa, não onde vende). Nos ETFs o setor vem da composição do ETF (ou de um ETF americano equivalente, nos europeus sem composição); indústria e país dos ETFs não existem no Yahoo e aparecem como 'ETF (sem detalhe)'. A moeda é a da cotação de cada ativo, sem olhar para dentro dos ETFs. Os nomes de setores e indústrias vêm em inglês, como no Yahoo.")
 
 with top:
     b1, b2, b3, b4, b5, b6, _ = st.columns([1.1, 1.3, 0.9, 1.5, 2.0, 1.4, 0.3]); b6.toggle("🌙 Tema escuro", key="dark", on_change=lambda: st.query_params.update({"tema": "escuro" if st.session_state["dark"] else "claro"})); b4.toggle("Pré/pós-mercado", value=True, key="ext_on"); b5.toggle("Custo ao câmbio da compra", value=True, key="cost_hist")
