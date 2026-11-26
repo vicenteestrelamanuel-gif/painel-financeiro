@@ -722,19 +722,23 @@ def get_LT(dfa, F):
 DIMS = {"Setor": "#7C5CFF", "Indústria": "#0FB5A6", "País": "#F59E0B", "Moeda": "#3B82F6"}
 
 def exposure(sub, F, LT, dim):
-    """Valor em € por setor / indústria / país / moeda. Setor dos ETFs: repartido pela composição do ETF. Indústria e país dos ETFs: sem detalhe no Yahoo."""
+    """Valor em € por setor / indústria / país / moeda. ETFs vistos por dentro: setor pelos pesos do ETF; indústria e país pelas maiores posições (o Yahoo só dá as 10 maiores)."""
     acc = {}
     def add(k, v): acc[k] = acc.get(k, 0.0) + v
     for _, r in sub.iterrows():
         v = float(r["Valor €"]); tk = r["Ativo"]; f = F.get(S["ymap"].get(tk, tk)) or {}
         if dim == "Moeda": add(r["Moeda"] or "Sem dados", v); continue
+        key = {"Setor": "sector", "Indústria": "industry", "País": "country"}[dim]
         if f.get("quoteType") == "ETF" or tk in LOOK:
             lt = LT.get(tk); ss = sum(lt["sectors"].values()) if lt else 0
-            if dim == "Setor" and ss > 0:
+            if dim == "Setor" and ss > 0:  # o Yahoo dá os pesos por setor do ETF inteiro
                 for k_, w_ in lt["sectors"].items(): add(k_, v * w_ / ss)
+            elif lt and lt["top"]:  # indústria/país: só se conhecem as maiores posições; o resto fica à parte
+                for sy_, _, w_ in lt["top"]: add((F.get(sy_) or {}).get(key) or "Sem dados (posições do ETF)", v * w_)
+                add("Resto dos ETFs (sem detalhe)", v * max(0.0, 1 - sum(x[2] for x in lt["top"])))
             else: add("ETF (sem detalhe)", v)
             continue
-        add(f.get({"Setor": "sector", "Indústria": "industry", "País": "country"}[dim]) or "Sem dados", v)
+        add(f.get(key) or "Sem dados", v)
     s_ = pd.Series(acc, dtype=float).sort_values(ascending=False); tot = s_.sum()
     return pd.DataFrame({dim: s_.index, "Valor €": s_.values, "Peso %": s_.values / tot * 100 if tot else 0.0})
 
@@ -1277,10 +1281,15 @@ with t_exp:
         n_ok = sum(1 for v in F.values() if v.get("quoteType")); c_a, c_b = st.columns([4, 1])
         (c_a.warning if n_ok < len(syms) * 0.6 else c_a.caption)(f"Dados obtidos para {n_ok} de {len(syms)} ativos." + ("" if n_ok >= len(syms) * 0.6 else " O Yahoo não respondeu aos restantes; ficam como 'Sem dados'. Espera uns minutos e tenta de novo."))
         if c_b.button("🔁 Tentar de novo", key="exp_retry"): F = fund_all(syms, force=True); st.rerun()
-        LT = get_LT(dfa, F); sub = dfa if pick_e == "Carteira toda" else dfa[dfa["Pie"] == pick_e]
+        LT = get_LT(dfa, F); hs = tuple(sorted({x[0] for lt in LT.values() for x in lt["top"]} - set(syms)))
+        if hs:
+            with st.spinner(f"A recolher os dados das maiores posições dos ETFs ({len(hs)} empresas; a primeira vez demora)..."): F = {**F, **fund_all(hs)}
+            n_h = sum(1 for x in hs if (F.get(x) or {}).get("quoteType")); st.caption(f"ETFs vistos por dentro (10 maiores posições de cada): " + ", ".join(LT) + f". Dados obtidos para {n_h} de {len(hs)} empresas." + ("" if n_h >= len(hs) * 0.6 else " O Yahoo não respondeu a muitas; usa 'Tentar de novo' daqui a uns minutos."))
+        sub = dfa if pick_e == "Carteira toda" else dfa[dfa["Pie"] == pick_e]
         E = {d: exposure(sub, F, LT, d) for d in DIMS}
         for c_, (d, col_) in zip(st.columns(4), DIMS.items()):
-            t0 = E[d].iloc[0]; c_.markdown(card(f"{d} principal", t0[d], f'<span class="chip nt">{num(t0["Peso %"], 1)} % · {len(E[d])} no total</span>', col_, t0["Peso %"]), unsafe_allow_html=True)
+            gen = E[d][d].str.startswith(("Resto", "ETF (sem", "Sem dados")); t0 = (E[d][~gen].iloc[0] if (~gen).any() else E[d].iloc[0]); cov = E[d].loc[~gen, "Peso %"].sum()
+            c_.markdown(card(f"{d} principal", t0[d], f'<span class="chip nt">{num(t0["Peso %"], 1)} % · {int((~gen).sum())} no total</span>' + (f'<span class="chip nt">{num(cov, 0)} % com detalhe</span>' if cov < 99.5 else ""), col_, t0["Peso %"]), unsafe_allow_html=True)
         for tab_, (d, col_) in zip(st.tabs(list(DIMS)), DIMS.items()):
             with tab_:
                 a, b = st.columns([3, 2]); a.plotly_chart(exp_chart(E[d], d, col_), width="stretch", key=f"exp_ch_{d}")
@@ -1289,7 +1298,7 @@ with t_exp:
                     with st.expander(f"Comparar pies · {d}"):
                         X = exp_pivot(dfa, F, LT, d, pies_e); st.dataframe(X.style.format({c: "{:.1f}" for c in X.columns[1:]}, na_rep="—"), hide_index=True, width="stretch")
                         st.caption("Percentagem do valor de cada pie (a coluna 'Carteira' é sobre o total).")
-        st.caption("Pesos calculados pelo valor atual em €. Setor, indústria e país vêm do Yahoo Finance (o país é o da sede da empresa, não onde vende). Nos ETFs o setor vem da composição do ETF (ou de um ETF americano equivalente, nos europeus sem composição); indústria e país dos ETFs não existem no Yahoo e aparecem como 'ETF (sem detalhe)'. A moeda é a da cotação de cada ativo, sem olhar para dentro dos ETFs. Os nomes de setores e indústrias vêm em inglês, como no Yahoo.")
+        st.caption("Pesos calculados pelo valor atual em €. Setor, indústria e país vêm do Yahoo Finance (o país é o da sede da empresa, não onde vende). Nos ETFs o setor vem dos pesos por setor do ETF (ou de um ETF americano equivalente, nos europeus sem composição). Indústria e país dos ETFs são calculados só com as 10 maiores posições de cada um, porque o Yahoo não dá a lista completa: o resto aparece como 'Resto dos ETFs (sem detalhe)' e o cartão indica a % com detalhe. A moeda é a da cotação de cada ativo, sem olhar para dentro dos ETFs. Os nomes vêm em inglês, como no Yahoo.")
 
 with top:
     b1, b2, b3, b4, b5, b6, _ = st.columns([1.1, 1.3, 0.9, 1.5, 2.0, 1.4, 0.3]); b6.toggle("🌙 Tema escuro", key="dark", on_change=lambda: st.query_params.update({"tema": "escuro" if st.session_state["dark"] else "claro"})); b4.toggle("Pré/pós-mercado", value=True, key="ext_on"); b5.toggle("Custo ao câmbio da compra", value=True, key="cost_hist")
