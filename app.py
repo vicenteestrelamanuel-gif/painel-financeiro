@@ -1,4 +1,4 @@
-import json, os, re, uuid, csv as _csv, io as _io, datetime as dt
+import json, os, re, uuid, datetime as dt
 import numpy as np, pandas as pd, plotly.express as px, plotly.graph_objects as go, requests, streamlit as st, yfinance as yf
 from plotly.subplots import make_subplots
 from zoneinfo import ZoneInfo
@@ -607,7 +607,7 @@ def _fund1(sym):
     try:
         t = yf.Ticker(sym); i = t.info or {}
         if not i.get("quoteType"): return {}
-        out = {k: i.get(k) for k in ("quoteType", "sector", "industry", "country", "revenueGrowth", "earningsGrowth", "forwardPE", "trailingPE", "debtToEquity", "currentRatio")}
+        out = {k: i.get(k) for k in ("quoteType", "sector", "revenueGrowth", "earningsGrowth", "forwardPE", "trailingPE", "debtToEquity", "currentRatio")}
         try:
             dv = t.dividends; dv.index = dv.index.tz_localize(None)
             out["div12"] = float(dv[dv.index >= pd.Timestamp.today() - pd.Timedelta(days=365)].sum()) / (100 if sym.endswith(".L") else 1)
@@ -617,10 +617,10 @@ def _fund1(sym):
         return {}
 
 @st.cache_resource
-def _fund_store_v2(): return {}  # símbolo -> (hora, dados); os sucessos ficam guardados e só se repetem os que falharam
+def _fund_store(): return {}  # símbolo -> (hora, dados); os sucessos ficam guardados e só se repetem os que falharam
 
 def fund_all(syms, force=False):
-    store = _fund_store_v2(); now = time.time()
+    store = _fund_store(); now = time.time()
     todo = [x for x in syms if force and not (store.get(x) or (0, {}))[1] or x not in store or now - store[x][0] > (21600 if store[x][1] else 600)]
     def job(sym):
         for k in range(2):
@@ -710,182 +710,6 @@ def lookthrough(tk):
     if (not c or not c["top"]) and tk in LOOK: c = etf_comp(LOOK[tk]); prox = True; used = LOOK[tk]
     return dict(top=c["top"], sectors=c["sectors"], proxy=prox, sym=used) if c and c["top"] else None
 
-# ---------- holdings completas dos ETFs (ficheiro do emissor) ----------
-ISH_ID = {"EUNL": 251882, "QDVE": 280510}  # iShares: ID do produto (confirmados); os outros ETFs configuram-se na app (link ou ficheiro)
-ISH_BASE = "https://www.ishares.com/uk/individual/en"
-SEC_NORM = {"information technology": "Technology", "health care": "Healthcare", "financials": "Financial Services", "financial": "Financial Services", "consumer discretionary": "Consumer Cyclical", "consumer staples": "Consumer Defensive",
-            "communication": "Communication Services", "communication services": "Communication Services", "materials": "Basic Materials", "cash and/or derivatives": "Cash e derivados", "cash": "Cash e derivados", "other": "Outros"}
-CTRY_NORM = {"korea (south)": "South Korea", "korea, republic of": "South Korea", "republic of korea": "South Korea", "hong kong sar china": "Hong Kong", "taiwan, province of china": "Taiwan", "united states of america": "United States", "usa": "United States", "russian federation": "Russia"}
-H_KEYS = dict(name=("name", "security name", "holding", "holdings", "holding name", "description", "security", "constituent", "company", "nome", "designação"),
-              ticker=("issuer ticker", "ticker", "symbol", "ticker symbol", "holding ticker", "código", "simbolo", "símbolo"), isin=("isin",), sector=("sector", "gics sector", "setor"),
-              country=("location", "country", "país", "pais", "country of risk", "domicile"), currency=("market currency", "currency", "moeda", "local currency", "trading currency"), asset=("asset class", "type", "tipo de ativo"))
-
-def _num(x):
-    if x is None: return np.nan
-    t = str(x).strip().replace("%", "").replace("\u00a0", "").replace("\u202f", "").replace(" ", "").replace("’", "").replace("'", "")
-    if not t or t in ("-", "--", "nan"): return np.nan
-    if "," in t and "." in t: t = t.replace(".", "").replace(",", ".") if t.rfind(",") > t.rfind(".") else t.replace(",", "")
-    elif "," in t: t = t.replace(",", ".")
-    try: return float(t)
-    except ValueError: return np.nan
-
-def _lab(x, norm):
-    t = "" if x is None or (isinstance(x, float) and np.isnan(x)) else str(x).strip()
-    return "Sem dados" if t in ("", "-", "nan", "None") else norm.get(t.lower(), t)
-
-def parse_holdings(raw):
-    """Lê um ficheiro de holdings (CSV/Excel de qualquer emissor): procura a linha de cabeçalho e as colunas pelo nome. Devolve (DataFrame normalizado, data) ou (None, motivo)."""
-    try:
-        if raw[:2] == b"PK":
-            rows = pd.read_excel(_io.BytesIO(raw), header=None, dtype=str).fillna("").values.tolist(); head = [" ".join(map(str, r)) for r in rows[:25]]; cand = [rows]
-        else:
-            txt = raw.decode("utf-8-sig") if isinstance(raw, bytes) else raw
-            lines = txt.splitlines(); head = lines[:25]; cand = [list(_csv.reader(lines, delimiter=dl)) for dl in (",", ";", "\t")]
-    except UnicodeDecodeError:
-        txt = raw.decode("latin-1"); lines = txt.splitlines(); head = lines[:25]; cand = [list(_csv.reader(lines, delimiter=dl)) for dl in (",", ";", "\t")]
-    except Exception as e:
-        return None, f"não consegui abrir o ficheiro ({type(e).__name__}); se for Excel, grava como CSV"
-    best = None
-    for rows in cand:
-        for i, r in enumerate(rows[:80]):
-            cl = [str(c_).strip().lower() for c_ in r]
-            if len(cl) >= 3 and any(c_ in H_KEYS["name"] for c_ in cl) and any(("weight" in c_ or "% of" in c_ or "weighting" in c_ or "peso" in c_ or "ponder" in c_) for c_ in cl):
-                if best is None or len(r) > len(best[1][best[0]]): best = (i, rows)
-                break
-    if best is None: return None, "não encontrei as colunas 'Name' e 'Weight' no ficheiro"
-    i0, rows = best; hdr = [str(c_).strip().lower() for c_ in rows[i0]]
-    def col(keys, contains=()):
-        for k in keys:
-            if k in hdr: return hdr.index(k)
-        for k in contains:
-            for j, h in enumerate(hdr):
-                if k in h: return j
-        return None
-    ci = {k: col(v) for k, v in H_KEYS.items()}; ci["weight"] = col(("weight (%)", "weight", "weighting", "% of net assets", "% of fund", "peso (%)"), ("weight", "% of", "weighting", "peso", "ponder"))
-    if ci["weight"] is None or ci["name"] is None: return None, "não encontrei as colunas 'Name' e 'Weight' no ficheiro"
-    g = lambda r, k: (r[ci[k]] if ci[k] is not None and ci[k] < len(r) else None)
-    out = [dict(ticker=g(r, "ticker"), name=g(r, "name"), isin=g(r, "isin"), weight=_num(g(r, "weight")), sector=g(r, "sector"), country=g(r, "country"), currency=g(r, "currency"), asset=g(r, "asset"))
-           for r in rows[i0 + 1:] if len(r) > ci["name"] and str(g(r, "name") or "").strip()]
-    df = pd.DataFrame(out)
-    if df.empty: return None, "o ficheiro não tem linhas de holdings"
-    df = df[df["weight"].notna() & (df["weight"] > 0)].copy()
-    if df.empty: return None, "não consegui ler os pesos"
-    df["weight"] = df["weight"] / df["weight"].sum()
-    df["sector"] = df["sector"].map(lambda x: _lab(x, SEC_NORM)); df["country"] = df["country"].map(lambda x: _lab(x, CTRY_NORM)); df["currency"] = df["currency"].map(lambda x: _lab(x, {}).upper() if _lab(x, {}) != "Sem dados" else "Sem dados")
-    df["currency"] = df["currency"].replace({"GBX": "GBP"}); df["ticker"] = df["ticker"].map(lambda x: "" if x is None else str(x).strip()); df["name"] = df["name"].map(lambda x: str(x).strip())
-    asof = next((re.sub(r'[",]+', " ", ln.lower().split("as of")[-1]).strip().title() for ln in head if "as of" in ln.lower()), None)
-    return df.sort_values("weight", ascending=False).reset_index(drop=True), asof
-
-def ish_csv_url(u, tk):
-    """Página de produto da iShares/BlackRock -> link do CSV de holdings; outros links ficam como estão."""
-    if "filetype=" in u.lower() or re.search(r"\.(csv|xlsx?|ajax)(\?|$)", u, re.I): return u
-    m = re.match(r"(https?://[^?#]*?)/products/(\d+)", u)
-    return f"{m.group(1)}/products/{m.group(2)}/x?fileType=csv&fileName={tk}_holdings&dataType=fund" if m else u
-
-@st.cache_data(ttl=43200, show_spinner=False)
-def fetch_holdings(url):
-    r = requests.get(url, timeout=45, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36", "Accept": "text/csv,application/vnd.ms-excel,*/*"})
-    r.raise_for_status(); df, info = parse_holdings(r.content)
-    if df is None: raise ValueError(info)
-    return df, info
-
-def holdings_source(tk):
-    """Holdings completas de um ETF: ficheiro carregado > link configurado > iShares automático. Devolve (dict, None) ou (None, motivo)."""
-    h = (S.get("hold_files") or {}).get(tk)
-    if h:
-        try: return dict(df=pd.read_csv(_io.StringIO(h["csv"]), keep_default_na=False), src=f"ficheiro «{h['name']}»", asof=h.get("asof")), None
-        except Exception as e: return None, f"ficheiro guardado ilegível ({e})"
-    u = (S.get("hold_src") or {}).get(tk); auto = False
-    if not u and tk in ISH_ID: u = f"{ISH_BASE}/products/{ISH_ID[tk]}/x"; auto = True
-    if not u: return None, "sem fonte configurada"
-    url = ish_csv_url(u, tk); err = None
-    for cand in ([url] + ([url.replace("/uk/individual/en", "/ch/individual/en") + "&switchLocale=Y"] if "/uk/individual/en" in url else [])):
-        try:
-            df, asof = fetch_holdings(cand); return dict(df=df, src=("iShares (automático)" if auto else "link configurado"), asof=asof), None
-        except Exception as e: err = f"{type(e).__name__}: {str(e)[:120]}"
-    return None, f"falhou o descarregamento ({err})"
-
-def is_etf(tk, F):
-    return (F.get(S["ymap"].get(tk, tk)) or {}).get("quoteType") == "ETF" or tk in LOOK or tk in ISH_ID or tk in (S.get("hold_src") or {}) or tk in (S.get("hold_files") or {})
-
-def get_FULL(dfa, F):
-    FULL, ERR = {}, {}
-    for tk in dfa["Ativo"].unique():
-        if is_etf(tk, F):
-            fu, why = holdings_source(tk)
-            if fu is not None: FULL[tk] = fu
-            else: ERR[tk] = why
-    return FULL, ERR
-
-def top_ysyms(df, n=30):
-    """Maiores posições com ticker americano utilizável no Yahoo (para ir buscar a indústria): [(símbolo Yahoo, peso)]."""
-    out = []
-    for _, r in df.nlargest(n, "weight").iterrows():
-        t = str(r["ticker"]).strip().upper().replace(" ", "-").replace(".", "-"); c = str(r["country"])
-        if re.fullmatch(r"[A-Z]{1,5}(-[A-Z])?", t) and c in ("United States", "Sem dados"): out.append((t, float(r["weight"])))
-    return out
-
-def get_LT(dfa, F, skip=()):
-    """Composição resumida (10 maiores posições + pesos por setor, Yahoo) dos ETFs que não têm ficheiro completo."""
-    out = {}
-    for tk in dfa["Ativo"].unique():
-        if tk in skip: continue
-        if (F.get(S["ymap"].get(tk, tk)) or {}).get("quoteType") == "ETF" or tk in LOOK:
-            lt = lookthrough(tk)
-            if lt: out[tk] = lt
-    return out
-
-DIMS = {"Setor": "#7C5CFF", "Indústria": "#0FB5A6", "País": "#F59E0B", "Moeda": "#3B82F6"}
-
-def exposure(sub, F, LT, dim, FULL=None, cur_look=True):
-    """Valor em € por setor / indústria / país / moeda. ETFs com ficheiro completo: setor, país e moeda pelo ficheiro; indústria pelas maiores posições (Yahoo). Sem ficheiro: pesos por setor e 10 maiores posições do Yahoo."""
-    acc = {}; FULL = FULL or {}
-    def add(k, v): acc[k] = acc.get(k, 0.0) + v
-    for _, r in sub.iterrows():
-        v = float(r["Valor €"]); tk = r["Ativo"]; f = F.get(S["ymap"].get(tk, tk)) or {}; fu = FULL.get(tk); d_ = fu["df"] if fu else None
-        if dim == "Moeda":
-            if d_ is not None and cur_look and (d_["currency"] != "Sem dados").any():
-                for k_, w_ in d_.groupby("currency")["weight"].sum().items(): add(k_, v * w_)
-            else: add(r["Moeda"] or "Sem dados", v)
-            continue
-        key = {"Setor": "sector", "Indústria": "industry", "País": "country"}[dim]
-        if d_ is not None:
-            if dim in ("Setor", "País") and (d_[key] != "Sem dados").any():
-                for k_, w_ in d_.groupby(key)["weight"].sum().items(): add(k_, v * w_)
-                continue
-            if dim == "Indústria":
-                got = 0.0
-                for sy_, w_ in top_ysyms(d_):
-                    ind = (F.get(sy_) or {}).get("industry")
-                    if ind: add(ind, v * w_); got += w_
-                    else: add("Sem dados (posições do ETF)", v * w_); got += w_
-                add("Resto dos ETFs (sem detalhe)", v * max(0.0, 1 - got)); continue
-        if f.get("quoteType") == "ETF" or tk in LOOK or d_ is not None:
-            lt = LT.get(tk); ss = sum(lt["sectors"].values()) if lt else 0
-            if dim == "Setor" and ss > 0:  # o Yahoo dá os pesos por setor do ETF inteiro
-                for k_, w_ in lt["sectors"].items(): add(k_, v * w_ / ss)
-            elif lt and lt["top"]:  # só se conhecem as maiores posições; o resto fica à parte
-                for sy_, _, w_ in lt["top"]: add((F.get(sy_) or {}).get(key) or "Sem dados (posições do ETF)", v * w_)
-                add("Resto dos ETFs (sem detalhe)", v * max(0.0, 1 - sum(x[2] for x in lt["top"])))
-            else: add("ETF (sem detalhe)", v)
-            continue
-        add(f.get(key) or "Sem dados", v)
-    s_ = pd.Series(acc, dtype=float).sort_values(ascending=False); tot = s_.sum()
-    return pd.DataFrame({dim: s_.index, "Valor €": s_.values, "Peso %": s_.values / tot * 100 if tot else 0.0})
-
-def exp_chart(E, dim, color):
-    d = E.copy()
-    if len(d) > 12: d = pd.concat([d.head(11), pd.DataFrame({dim: [f"Outros ({len(d) - 11})"], "Valor €": [d.iloc[11:]["Valor €"].sum()], "Peso %": [d.iloc[11:]["Peso %"].sum()]})], ignore_index=True)
-    d = d.iloc[::-1].copy(); d["t"] = d["Peso %"].map(lambda x: f"{num(x, 1)} %")
-    fig = px.bar(d, x="Peso %", y=dim, orientation="h", text="t", custom_data=["Valor €"])
-    fig.update_traces(marker_color=color, textposition="outside", cliponaxis=False, hovertemplate="%{y}<br>%{x:.1f} %<br>%{customdata[0]:,.2f} €<extra></extra>")
-    return fig.update_layout(height=max(260, 36 * len(d) + 60), margin=dict(t=10, b=10, l=10, r=50), xaxis=dict(title=None, range=[0, max(d["Peso %"].max() * 1.18, 5)], showgrid=False, visible=False), yaxis=dict(title=None), paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
-
-def exp_pivot(dfa, F, LT, dim, pies, FULL=None, cur_look=True):
-    X = pd.DataFrame({p: exposure(dfa[dfa["Pie"] == p], F, LT, dim, FULL, cur_look).set_index(dim)["Peso %"] for p in pies})
-    X.insert(0, "Carteira", exposure(dfa, F, LT, dim, FULL, cur_look).set_index(dim)["Peso %"])
-    return X.sort_values("Carteira", ascending=False).reset_index().rename(columns={"index": dim})
-
 def day_changes(syms):
     """Variação do dia (%) por símbolo: preço atual (com pré/pós-mercado, se ligado) face ao fecho anterior."""
     syms = tuple(sorted(set(syms))); C = closes(syms); out = {}
@@ -954,7 +778,7 @@ def parse_csv(f):
 
 st.markdown('<div class="brand">📈 Painel Financeiro</div>', unsafe_allow_html=True)
 top = st.container()
-t1, t_rad, t_exp, t_day, t_div, t_cal, t2, t3 = st.tabs(["Portfólio", "Radar", "Exposição", "Resumo do dia", "Dividendos", "Calendário", "Transações", "Despesas"])
+t1, t_rad, t_day, t_div, t_cal, t2, t3 = st.tabs(["Portfólio", "Radar", "Resumo do dia", "Dividendos", "Calendário", "Transações", "Despesas"])
 
 # ================= PORTFÓLIO =================
 with t1:
@@ -1400,91 +1224,6 @@ with t_rad:
 | **Diversificação** | posições efetivas 1/Σw² (40 %), setores efetivos (30 %) e correlação média ponderada entre posições nos últimos 12 meses (30 %). Os ETFs são vistos por dentro: as maiores posições de cada um contam como posições próprias, o resto conta como linhas de 1 %, e os setores vêm da composição do ETF | 1 posição, 1 setor, correlação 0,8 | 25 posições, 8 setores, correlação 0,2 |
 
 Todas as médias são ponderadas pelo valor de cada posição, só com as posições que têm dados, e a tabela mostra a cobertura. Os fundamentais vêm do Yahoo Finance (podem estar atrasados ou em falta, sobretudo em ETFs) e são uma fotografia de hoje, não histórico. Não é aconselhamento financeiro.""")
-
-with t_exp:
-    dfa = positions("pie")
-    if dfa.empty: st.info("Sem posições abertas.")
-    else:
-        pies_e = [p for p in S["pies"] if p in set(dfa["Pie"])]
-        pick_e = st.pills("Âmbito", ["Carteira toda"] + pies_e, default="Carteira toda", key="exp_pie", label_visibility="collapsed") or "Carteira toda"
-        syms = tuple(sorted({S["ymap"].get(t, t) for t in dfa["Ativo"]}))
-        with st.spinner("A recolher setor, indústria e país (a primeira vez demora)..."): F = fund_all(syms)
-        n_ok = sum(1 for v in F.values() if v.get("quoteType")); c_a, c_b = st.columns([4, 1])
-        (c_a.warning if n_ok < len(syms) * 0.6 else c_a.caption)(f"Dados obtidos para {n_ok} de {len(syms)} ativos." + ("" if n_ok >= len(syms) * 0.6 else " O Yahoo não respondeu aos restantes; ficam como 'Sem dados'. Espera uns minutos e tenta de novo."))
-        if c_b.button("🔁 Tentar de novo", key="exp_retry"): F = fund_all(syms, force=True); st.rerun()
-        with st.spinner("A descarregar as holdings dos ETFs..."): FULL, ERR = get_FULL(dfa, F)
-        LT = get_LT(dfa, F, skip=tuple(FULL))
-        hs = tuple(sorted(({y for fu in FULL.values() for y, _ in top_ysyms(fu["df"])} | {x[0] for lt in LT.values() for x in lt["top"]}) - set(syms)))
-        if hs:
-            with st.spinner(f"A recolher a indústria das maiores posições dos ETFs ({len(hs)} empresas; a primeira vez demora)..."): F = {**F, **fund_all(hs)}
-            n_h = sum(1 for x in hs if (F.get(x) or {}).get("quoteType")); st.caption(f"Dados da indústria obtidos para {n_h} de {len(hs)} empresas dentro dos ETFs." + ("" if n_h >= len(hs) * 0.6 else " O Yahoo não respondeu a muitas; usa 'Tentar de novo' daqui a uns minutos."))
-        etf_all = [t for t in dfa["Ativo"].unique() if is_etf(t, F)]
-        if etf_all:
-            cur_look = st.toggle("Moeda: ver as moedas das empresas dentro dos ETFs (em vez da moeda de cotação do ETF)", value=True, key="exp_curlook")
-            ok_t = [t for t in etf_all if t in FULL]; bad = [t for t in etf_all if t not in FULL]
-            st.caption((f"Holdings completas: {', '.join(ok_t)}. " if ok_t else "") + (f"Só as 10 maiores posições (Yahoo): {', '.join(bad)} – configura a fonte em '📋 Holdings dos ETFs'." if bad else ""))
-        else: cur_look = False
-        sub = dfa if pick_e == "Carteira toda" else dfa[dfa["Pie"] == pick_e]
-        E = {d: exposure(sub, F, LT, d, FULL, cur_look) for d in DIMS}
-        for c_, (d, col_) in zip(st.columns(4), DIMS.items()):
-            gen = E[d][d].str.startswith(("Resto", "ETF (sem", "Sem dados")); t0 = (E[d][~gen].iloc[0] if (~gen).any() else E[d].iloc[0]); cov = E[d].loc[~gen, "Peso %"].sum()
-            c_.markdown(card(f"{d} principal", t0[d], f'<span class="chip nt">{num(t0["Peso %"], 1)} % · {int((~gen).sum())} no total</span>' + (f'<span class="chip nt">{num(cov, 0)} % com detalhe</span>' if cov < 99.5 else ""), col_, t0["Peso %"]), unsafe_allow_html=True)
-        tabs_e = st.tabs(list(DIMS) + ["📋 Holdings dos ETFs"])
-        for tab_, (d, col_) in zip(tabs_e, DIMS.items()):
-            with tab_:
-                a_, b_ = st.columns([3, 2]); a_.plotly_chart(exp_chart(E[d], d, col_), width="stretch", key=f"exp_ch_{d}")
-                b_.dataframe(E[d].style.format({"Valor €": "{:.2f}", "Peso %": "{:.1f}"}), hide_index=True, width="stretch", height=min(520, 38 * len(E[d]) + 40), column_config={"Peso %": st.column_config.ProgressColumn("Peso", format="%.1f%%", min_value=0, max_value=100)})
-                if pick_e == "Carteira toda" and len(pies_e) > 1:
-                    with st.expander(f"Comparar pies · {d}"):
-                        X = exp_pivot(dfa, F, LT, d, pies_e, FULL, cur_look); st.dataframe(X.style.format({c: "{:.1f}" for c in X.columns[1:]}, na_rep="—"), hide_index=True, width="stretch")
-                        st.caption("Percentagem do valor de cada pie (a coluna 'Carteira' é sobre o total).")
-        with tabs_e[4]:
-            etfs_sub = [t for t in etf_all if t in set(sub["Ativo"])]
-            if not etfs_sub: st.info("Este âmbito não tem ETFs.")
-            else:
-                st.dataframe(pd.DataFrame([dict(ETF=t, Fonte=(FULL[t]["src"] if t in FULL else "só 10 maiores (Yahoo)"), Holdings=(len(FULL[t]["df"]) if t in FULL else None), Data=(FULL[t]["asof"] if t in FULL else None), Estado=("ok" if t in FULL else ERR.get(t, ""))) for t in etfs_sub]), hide_index=True, width="stretch")
-                pick_h = st.pills("ETF", ["Todas as empresas (agregado)"] + etfs_sub, default=etfs_sub[0], key=f"exp_hold_pick_{pick_e}", label_visibility="collapsed") or etfs_sub[0]
-                q = st.text_input("Pesquisar empresa, ticker, setor ou país", key="exp_hold_q", placeholder="ex.: NVIDIA, Japan, Technology").strip().lower()
-                if pick_h in etfs_sub:
-                    tk = pick_h; vpos = float(sub.loc[sub["Ativo"] == tk, "Valor €"].sum())
-                    if tk in FULL:
-                        H = FULL[tk]["df"].copy(); H["Na tua carteira €"] = H["weight"] * vpos; H["Peso no ETF %"] = H["weight"] * 100
-                        H = H[["name", "ticker", "sector", "country", "currency", "Peso no ETF %", "Na tua carteira €"]].rename(columns={"name": "Empresa", "ticker": "Ticker", "sector": "Setor", "country": "País", "currency": "Moeda"})
-                        if q: H = H[H.apply(lambda r: q in " ".join(map(str, r.values[:5])).lower(), axis=1)]
-                        st.caption(f"{tk}: {len(FULL[tk]['df'])} holdings · fonte: {FULL[tk]['src']}" + (f" · dados de {FULL[tk]['asof']}" if FULL[tk]["asof"] else "") + f" · posição no âmbito: {num(vpos, 2)} €")
-                        st.dataframe(H.style.format({"Peso no ETF %": "{:.3f}", "Na tua carteira €": "{:.2f}"}), hide_index=True, width="stretch", height=520, column_config={"Peso no ETF %": st.column_config.ProgressColumn("Peso no ETF", format="%.2f%%", min_value=0, max_value=float(max(1.0, H["Peso no ETF %"].max()) if len(H) else 1))})
-                        st.download_button("⬇️ CSV das holdings", H.to_csv(index=False).encode("utf-8"), file_name=f"{tk}_holdings_{dt.date.today()}.csv", mime="text/csv", key=f"exp_dl_{tk}")
-                    else: st.warning(f"{tk}: {ERR.get(tk, 'sem holdings')}. Configura a fonte aqui por baixo.")
-                    with st.expander(f"⚙️ Fonte das holdings de {tk}", expanded=tk not in FULL):
-                        st.caption("Cola o link da página do ETF na iShares/BlackRock (a app converte-o no CSV de holdings) ou um link direto para o ficheiro. Para outros emissores, descarrega o ficheiro de holdings na página do ETF e carrega-o aqui. Fica guardado.")
-                        u_in = st.text_input("Link", value=(S.get("hold_src") or {}).get(tk, ""), key=f"hs_url_{tk}"); up = st.file_uploader("ou ficheiro (CSV; Excel só se a app tiver openpyxl)", type=["csv", "xlsx", "xls"], key=f"hs_up_{tk}")
-                        g1, g2 = st.columns(2)
-                        if g1.button("Guardar fonte", key=f"hs_save_{tk}", width="stretch"):
-                            if up is not None:
-                                dfp, info = parse_holdings(up.getvalue())
-                                if dfp is None: st.error(f"Ficheiro não aceite: {info}")
-                                else: S.setdefault("hold_files", {})[tk] = dict(csv=dfp.to_csv(index=False), name=up.name, asof=info); (S.get("hold_src") or {}).pop(tk, None); save(); st.rerun()
-                            elif u_in.strip(): S.setdefault("hold_src", {})[tk] = u_in.strip(); (S.get("hold_files") or {}).pop(tk, None); save(); fetch_holdings.clear(); st.rerun()
-                            else: st.warning("Indica um link ou carrega um ficheiro.")
-                        if g2.button("Remover fonte", key=f"hs_del_{tk}", width="stretch"):
-                            (S.get("hold_src") or {}).pop(tk, None); (S.get("hold_files") or {}).pop(tk, None); save(); fetch_holdings.clear(); st.rerun()
-                else:
-                    rows = []
-                    for tk in etfs_sub:
-                        if tk in FULL: rows.append(FULL[tk]["df"].assign(eur=lambda x, v=float(sub.loc[sub["Ativo"] == tk, "Valor €"].sum()): x["weight"] * v, via="Via ETFs", key=lambda x: np.where(x["ticker"].str.len() > 0, x["ticker"].str.upper(), x["name"].str.upper()))[["key", "name", "eur", "via"]])
-                    for _, r in sub[~sub["Ativo"].isin(etf_all)].iterrows(): rows.append(pd.DataFrame([dict(key=str(r["Ativo"]).upper(), name=str(r["Ativo"]), eur=float(r["Valor €"]), via="Direto")]))
-                    if not rows: st.info("Sem holdings completas para agregar.")
-                    else:
-                        A = pd.concat(rows, ignore_index=True); P = A.pivot_table(index="key", columns="via", values="eur", aggfunc="sum", fill_value=0.0)
-                        for c in ("Via ETFs", "Direto"):
-                            if c not in P: P[c] = 0.0
-                        P["Total €"] = P["Via ETFs"] + P["Direto"]; P["Empresa"] = A.groupby("key")["name"].first(); tot = float(sub["Valor €"].sum()); P["% da carteira"] = P["Total €"] / tot * 100
-                        P = P.reset_index().rename(columns={"key": "Ticker", "Via ETFs": "Via ETFs €", "Direto": "Direto €"})[["Empresa", "Ticker", "Via ETFs €", "Direto €", "Total €", "% da carteira"]].sort_values("Total €", ascending=False)
-                        if q: P = P[P.apply(lambda r: q in " ".join(map(str, r.values[:2])).lower(), axis=1)]
-                        st.caption("Soma, por empresa, o que tens diretamente e o que tens através dos ETFs com holdings completas. A % é sobre o valor total do âmbito escolhido (ETFs sem ficheiro completo não entram na repartição).")
-                        st.dataframe(P.style.format({"Via ETFs €": "{:.2f}", "Direto €": "{:.2f}", "Total €": "{:.2f}", "% da carteira": "{:.2f}"}), hide_index=True, width="stretch", height=520)
-                        st.download_button("⬇️ CSV agregado", P.to_csv(index=False).encode("utf-8"), file_name=f"holdings_agregado_{dt.date.today()}.csv", mime="text/csv", key="exp_dl_agg")
-        st.caption("Pesos calculados pelo valor atual em €. Nos ETFs com holdings completas, setor, país e moeda vêm do ficheiro do emissor (100 % das posições) e a indústria das 30 maiores posições americanas (Yahoo), com o resto em 'Resto dos ETFs (sem detalhe)'. Sem ficheiro, usa-se o Yahoo: pesos por setor do ETF e só as 10 maiores posições para indústria e país. Setor, indústria e país das ações vêm do Yahoo (o país é o da sede). Os nomes de setores e indústrias vêm em inglês.")
 
 with top:
     b1, b2, b3, b4, b5, b6, _ = st.columns([1.1, 1.3, 0.9, 1.5, 2.0, 1.4, 0.3]); b6.toggle("🌙 Tema escuro", key="dark", on_change=lambda: st.query_params.update({"tema": "escuro" if st.session_state["dark"] else "claro"})); b4.toggle("Pré/pós-mercado", value=True, key="ext_on"); b5.toggle("Custo ao câmbio da compra", value=True, key="cost_hist")
