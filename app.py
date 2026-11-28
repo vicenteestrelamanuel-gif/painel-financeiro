@@ -359,7 +359,7 @@ def detail(tk):
     d = h[h.index >= start]
     if len(d) < 3: st.warning("Poucos dados neste período."); return
     c = d["Close"]; r = c.pct_change().dropna(); dd = c / c.cummax() - 1; i = info(sym)
-    is_etf = i.get("quoteType") == "ETF" or tk in LOOK
+    is_etf = isetf(tk, i)
     labs = ["Estatísticas"] + (["Fundamentais", "Financeiros"] if not is_etf else []) + ["Gráficos", "Previsão", "Dados"] + (["Composição"] if is_etf else []); T_ = dict(zip(labs, st.tabs(labs)))
     t_stats, t_graf, t_prev, t_dados = T_["Estatísticas"], T_["Gráficos"], T_["Previsão"], T_["Dados"]
     with t_stats:
@@ -689,6 +689,7 @@ def radar_scores(sub, F, H, LT=None):
     return dict(sc=sc, cv=cv, raw=raw, D=D)
 
 LOOK = {"EUNL": "URTH", "QDVE": "XLK", "EUNK": "IEUR", "IS3N": "IEMG", "QUTM": "QTUM"}  # ETFs europeus (UCITS) sem composição no Yahoo: ETF americano equivalente como proxy aproximado
+isetf = lambda tk, f: (f or {}).get("quoteType") in ("ETF", "MUTUALFUND") or tk in LOOK or tk in S.get("etfextra", [])  # ETF = o Yahoo diz que é, está na lista fixa, ou foi marcado à mão
 SEC_MAP = {"realestate": "Real Estate", "consumer_cyclical": "Consumer Cyclical", "basic_materials": "Basic Materials", "consumer_defensive": "Consumer Defensive", "technology": "Technology", "communication_services": "Communication Services",
            "financial_services": "Financial Services", "utilities": "Utilities", "industrials": "Industrials", "energy": "Energy", "healthcare": "Healthcare"}
 
@@ -1330,8 +1331,8 @@ with t_rad:
         n_ok = sum(1 for v in F.values() if v.get("quoteType")); c_a, c_b = st.columns([4, 1])
         (c_a.warning if n_ok < len(syms) * 0.6 else c_a.caption)(f"Fundamentais obtidos para {n_ok} de {len(syms)} ativos." + ("" if n_ok >= len(syms) * 0.6 else " O Yahoo não respondeu aos restantes (costuma limitar pedidos); os eixos sem dados ficam a 0. Espera uns minutos e tenta de novo."))
         if c_b.button("🔁 Tentar de novo", key="rad_retry"): F = fund_all(syms, force=True); st.rerun()
-        LT = {tk: lt for tk in dfa["Ativo"].unique() if (F.get(S["ymap"].get(tk, tk)) or {}).get("quoteType") == "ETF" or tk in LOOK for lt in [lookthrough(tk)] if lt}
-        etfs_ = [tk for tk in dfa["Ativo"].unique() if (F.get(S["ymap"].get(tk, tk)) or {}).get("quoteType") == "ETF" or tk in LOOK]
+        LT = {tk: lt for tk in dfa["Ativo"].unique() if isetf(tk, F.get(S["ymap"].get(tk, tk))) for lt in [lookthrough(tk)] if lt}
+        etfs_ = [tk for tk in dfa["Ativo"].unique() if isetf(tk, F.get(S["ymap"].get(tk, tk)))]
         if etfs_: st.caption("ETFs vistos por dentro (composição): " + (", ".join(f"{k}" + (" (proxy " + v["sym"] + ")" if v["proxy"] else "") for k, v in LT.items()) or "nenhum") + (". Sem composição, tratados como uma só posição: " + ", ".join(t for t in etfs_ if t not in LT) if any(t not in LT for t in etfs_) else ""))
         R = {p: radar_scores(dfa[dfa["Pie"] == p], F, H, LT) for p in pies_r}; show = pies_r if pick == "Todas" else [pick]
         fig = go.Figure()
@@ -1384,15 +1385,18 @@ with t_exp:
         pick = c1.pills("Pie", ["Todas"] + pies_e, default="Todas", key="exp_pie", label_visibility="collapsed")or "Todas"
         est = c2.toggle("Estimar o resto de cada ETF pelas maiores posições", value=False, key="exp_est")
         sy_dir = {S["ymap"].get(t, t) for t in dfa["Ativo"]}; Fq = fund_all(tuple(sorted(sy_dir)))
-        LT = {tk: lt for tk in dfa["Ativo"].unique() if ((Fq.get(S["ymap"].get(tk, tk)) or {}).get("quoteType") == "ETF" or tk in LOOK) for lt in [lookthrough(tk)] if lt}
+        LT = {tk: lt for tk in dfa["Ativo"].unique() if isetf(tk, Fq.get(S["ymap"].get(tk, tk))) for lt in [lookthrough(tk)] if lt}
         hs = {x[0] for lt in LT.values() if lt.get("full") is None for x in lt["top"]}
         with st.spinner("A recolher setor, indústria, país e moeda (a primeira vez demora)..."): F = fund_all(tuple(sorted(sy_dir | hs)))
         n_ok = sum(1 for k in sy_dir | hs if (F.get(k) or {}).get("quoteType")); c_a, c_b = st.columns([4, 1])
         (c_a.warning if n_ok < len(sy_dir | hs) * 0.6 else c_a.caption)(f"Dados do Yahoo obtidos para {n_ok} de {len(sy_dir | hs)} ativos/holdings." + ("" if n_ok >= len(sy_dir | hs) * 0.6 else " O Yahoo não respondeu aos restantes; ficam em 'Sem dados'. Tenta de novo dentro de uns minutos."))
         if c_b.button("🔁 Tentar de novo", key="exp_retry"): fund_all(tuple(sorted(sy_dir | hs)), force=True); st.rerun()
-        etf_list = [tk for tk in dfa["Ativo"].unique() if tk not in ASSET_OVR and ((Fq.get(S["ymap"].get(tk, tk)) or {}).get("quoteType") == "ETF" or tk in LOOK)]
-        if etf_list:
+        etf_list = [tk for tk in dfa["Ativo"].unique() if tk not in ASSET_OVR and isetf(tk, Fq.get(S["ymap"].get(tk, tk)))]
+        if True:
             with st.expander("📂 Holdings completas dos ETFs · fonte e ficheiros", expanded=any((LT.get(t) or {}).get("full") is None for t in etf_list)):
+                outros_ = sorted(t for t in dfa["Ativo"].unique() if t not in ASSET_OVR and not isetf(t, Fq.get(S["ymap"].get(t, t))) or t in S.get("etfextra", []))
+                ex_ = st.multiselect("Tens algum ETF que não aparece aqui? Marca-o", outros_, default=[t for t in S.get("etfextra", []) if t in outros_], key="etf_extra")
+                if sorted(ex_) != sorted(S.get("etfextra", [])): S["etfextra"] = ex_; save(); st.rerun()
                 st.caption("Para cada ETF uso a lista completa de holdings (setor, país e moeda de cada empresa) em vez das 10 maiores do Yahoo. Fonte: CSV oficial da iShares através do link da página do ETF; se o link falhar, uso a última cópia guardada. Para outros emitentes (VanEck, Vanguard, ...) carrega o ficheiro de holdings do site deles (CSV ou Excel com colunas de nome e peso).")
                 if st.button("🔁 Atualizar holdings agora", key="hold_refresh"): _ish_fetch.clear(); _hold_read.clear(); st.rerun()
                 for tk in etf_list:
