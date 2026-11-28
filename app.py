@@ -698,6 +698,12 @@ def _blues(d):
         x = min(max(float(v) / mx, 0.0), 1.0) if v == v else 0.0
         return f"background-color: rgb({int(247 - x * 239)},{int(251 - x * 170)},{int(255 - x * 99)}); color: {'white' if x > 0.6 else 'black'}"
     return d.apply(lambda col: col.map(c))
+def _manual(F):
+    """Dados escritos à mão (setor, indústria, país, moeda) por cima dos do Yahoo; servem quando o Yahoo não responde."""
+    for tk, m in S.get("fundman", {}).items():
+        sy = S["ymap"].get(tk, tk)
+        if sy in F: F[sy] = {**(F[sy] or {}), **{k: v for k, v in m.items() if v}}
+    return F
 SEC_MAP = {"realestate": "Real Estate", "consumer_cyclical": "Consumer Cyclical", "basic_materials": "Basic Materials", "consumer_defensive": "Consumer Defensive", "technology": "Technology", "communication_services": "Communication Services",
            "financial_services": "Financial Services", "utilities": "Utilities", "industrials": "Industrials", "energy": "Energy", "healthcare": "Healthcare"}
 
@@ -1374,7 +1380,7 @@ with t_rad:
     else:
         pies_r = [p for p in S["pies"] if p in set(dfa["Pie"])]; pick = st.pills("Pie", ["Todas"] + pies_r, default="Todas", key="rad_pie", label_visibility="collapsed") or "Todas"
         syms = tuple(sorted({S["ymap"].get(t, t) for t in dfa["Ativo"]}))
-        with st.spinner("A recolher fundamentais e histórico de preços (a primeira vez demora)..."): F = fund_all(syms); H = closes1y(syms)
+        with st.spinner("A recolher fundamentais e histórico de preços (a primeira vez demora)..."): F = _manual(fund_all(syms)); H = closes1y(syms)
         n_ok = sum(1 for v in F.values() if v.get("quoteType")); c_a, c_b = st.columns([4, 1])
         (c_a.warning if n_ok < len(syms) * 0.6 else c_a.caption)(f"Fundamentais obtidos para {n_ok} de {len(syms)} ativos." + ("" if n_ok >= len(syms) * 0.6 else " O Yahoo não respondeu aos restantes (costuma limitar pedidos); os eixos sem dados ficam a 0. Espera uns minutos e tenta de novo."))
         if c_b.button("🔁 Tentar de novo", key="rad_retry"): F = fund_all(syms, force=True); st.rerun()
@@ -1434,7 +1440,7 @@ with t_exp:
         sy_dir = {S["ymap"].get(t, t) for t in dfa["Ativo"]}; Fq = fund_all(tuple(sorted(sy_dir)))
         LT = {tk: lt for tk in dfa["Ativo"].unique() if isetf(tk, Fq.get(S["ymap"].get(tk, tk))) for lt in [lookthrough(tk)] if lt}
         hs = {x[0] for lt in LT.values() if lt.get("full") is None for x in lt["top"]}
-        with st.spinner("A recolher setor, indústria, país e moeda (a primeira vez demora)..."): F = fund_all(tuple(sorted(sy_dir | hs)))
+        with st.spinner("A recolher setor, indústria, país e moeda (a primeira vez demora)..."): F = _manual(fund_all(tuple(sorted(sy_dir | hs))))
         n_ok = sum(1 for k in sy_dir | hs if (F.get(k) or {}).get("quoteType")); c_a, c_b = st.columns([4, 1])
         (c_a.warning if n_ok < len(sy_dir | hs) * 0.6 else c_a.caption)(f"Dados do Yahoo obtidos para {n_ok} de {len(sy_dir | hs)} ativos/holdings." + ("" if n_ok >= len(sy_dir | hs) * 0.6 else " O Yahoo não respondeu aos restantes; ficam em 'Sem dados'. Tenta de novo dentro de uns minutos."))
         if c_b.button("🔁 Tentar de novo", key="exp_retry"): fund_all(tuple(sorted(sy_dir | hs)), force=True); st.rerun()
@@ -1458,6 +1464,20 @@ with t_exp:
                         p_ = parse_holdings(_grid(up_.getvalue(), up_.name))
                         if p_: hold_put(tk, p_["df"], p_["date"] or dt.date.today().strftime("%d/%m/%Y"), "ficheiro"); st.session_state[f"hsig_{tk}"] = f"{up_.name}:{up_.size}"; st.rerun()
                         else: c_f.error("Não encontrei a tabela de holdings: preciso de uma coluna com o nome (ou ticker) e outra com o peso.")
+        dir_tk = [tk for tk in dfa["Ativo"].unique() if tk not in ASSET_OVR and tk not in etf_list]; fm_ = S.setdefault("fundman", {})
+        falta_ = [tk for tk in dir_tk if not (F.get(S["ymap"].get(tk, tk)) or {}).get("sector")]
+        if dir_tk:
+            with st.expander("✏️ Setor, indústria, país e moeda das ações · preencher à mão", expanded=bool(falta_)):
+                st.caption("Quando o Yahoo não responde, estes campos ficam vazios. Preenche aqui o que faltar (só as células que escreveres são guardadas) e a app passa a usar estes valores em vez dos do Yahoo. Setor: usa a lista; país em inglês (United States, Germany...); moeda de cotação (USD, EUR...).")
+                rows_ = []
+                for tk in dir_tk:
+                    y_ = F.get(S["ymap"].get(tk, tk)) or {}; m_ = fm_.get(tk) or {}
+                    rows_.append({"Ativo": tk, "Setor": m_.get("sector") or y_.get("sector") or None, "Indústria": m_.get("industry") or y_.get("industry") or None, "País": m_.get("country") or y_.get("country") or None, "Moeda": m_.get("currency") or y_.get("currency") or None})
+                ed_ = st.data_editor(pd.DataFrame(rows_), hide_index=True, disabled=["Ativo"], key="fm_ed", width="stretch", column_config={"Setor": st.column_config.SelectboxColumn(options=["Technology", "Financial Services", "Healthcare", "Consumer Cyclical", "Consumer Defensive", "Communication Services", "Industrials", "Energy", "Utilities", "Real Estate", "Basic Materials"])})
+                if st.button("Guardar dados das ações", key="fm_save"):
+                    cl_ = lambda x: str(x).strip() if x is not None and x == x else ""
+                    novo_ = {r["Ativo"]: {k: v for k, v in dict(sector=cl_(r["Setor"]), industry=cl_(r["Indústria"]), country=cl_(r["País"]), currency=cl_(r["Moeda"])).items() if v} for _, r in ed_.iterrows()}
+                    S["fundman"] = {k: v for k, v in novo_.items() if v}; save(); st.rerun()
         sub = dfa if pick == "Todas" else dfa[dfa["Pie"] == pick]; L, meta = exposure_lines(sub, F, LT); tot = sub["Valor €"].sum(); k_ = st.columns(3)
         k_[0].markdown(card("Valor da seleção", num(tot) + " €", f'<span class="chip nt">{len(sub)} posições</span>', "#6D5BF7" if pick == "Todas" else pcol(pick)), unsafe_allow_html=True)
         etf_v = sum(v for v, _ in meta.values()); k_[1].markdown(card("Em ETFs vistos por dentro", num(etf_v) + " €", f'<span class="chip nt">{len(meta)} ETFs com composição</span>', "#3B82F6"), unsafe_allow_html=True)
