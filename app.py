@@ -156,9 +156,10 @@ def ext_prices(syms):
 def positions(group):
     m, last, ACC = {}, {}, {}  # ACC: quantidade e custo (€, câmbio de cada compra) por ativo, somando todas as pies
     for t in sorted(S["tx"], key=lambda t: t["date"]):
-        last[t["tk"]] = t; ac = ACC.setdefault(t["tk"], [0.0, 0.0, 0.0])
-        if t["type"] == "Compra": ac[0] += t["qty"]; ac[1] += t["qty"] * t["price"] * t["fx"]; ac[2] += t["qty"] * t["price"]
-        else: g = min(1, t["qty"] / ac[0]) if ac[0] > 0 else 0; ac[1] -= ac[1] * g; ac[2] -= ac[2] * g; ac[0] -= t["qty"]
+        if not t.get("mv"):  # as transferências entre pies não mexem no custo médio da conta
+            last[t["tk"]] = t; ac = ACC.setdefault(t["tk"], [0.0, 0.0, 0.0])
+            if t["type"] == "Compra": ac[0] += t["qty"]; ac[1] += t["qty"] * t["price"] * t["fx"]; ac[2] += t["qty"] * t["price"]
+            else: g = min(1, t["qty"] / ac[0]) if ac[0] > 0 else 0; ac[1] -= ac[1] * g; ac[2] -= ac[2] * g; ac[0] -= t["qty"]
         p = m.setdefault((t["pie"] if group == "pie" else "—", t["tk"]), dict(Pie=t["pie"] if group == "pie" else "—", Ativo=t["tk"], Qtd=0.0, Custo=0.0, CN=0.0, pies=set()))
         p["pies"].add(t["pie"])
         if t["type"] == "Compra":
@@ -381,7 +382,7 @@ def detail(tk):
         else: fig.add_trace(go.Candlestick(x=d.index, open=d["Open"], high=d["High"], low=d["Low"], close=c, name="Preço"), 1, 1)
         if ma:
             for n, col in ((50, "#e5a113"), (200, "#8e5bd9")): fig.add_trace(go.Scatter(x=d.index, y=h["Close"].rolling(n).mean()[d.index], name=f"MM{n}", line=dict(color=col, width=1)), 1, 1)
-        tb = [t for t in txs if t["type"] == "Compra" and t["cur"] == cur and pd.Timestamp(t["date"]) >= start]
+        tb = [t for t in txs if t["type"] == "Compra" and not t.get("mv") and t["cur"] == cur and pd.Timestamp(t["date"]) >= start]
         if tb: fig.add_trace(go.Scatter(x=[t["date"] for t in tb], y=[t["price"] for t in tb], mode="markers", name="Minhas compras", marker=dict(size=9, color="#13935a", symbol="triangle-up")), 1, 1)
         fig.add_trace(go.Bar(x=d.index, y=d["Volume"], name="Volume", marker_color="#7a8699"), 2, 1)
         fig.update_layout(height=560, xaxis_rangeslider_visible=False, margin=dict(t=20), legend_orientation="h"); st.plotly_chart(fig, width="stretch")
@@ -921,7 +922,7 @@ def parse_csv(f):
         cur, ex = x["Currency (Price / share)"], x.get("Exchange rate")
         ex = 1.0 if pd.isna(ex) else float(ex)
         tk, qty, date = x["Ticker"], float(x["No. of shares"]), str(x["Time (UTC)"])[:10]
-        dup = any(t.get("bid") == x["ID"] or (t["tk"] == tk and t["date"] == date and abs(t["qty"] - qty) < 1e-6) for t in S["tx"])
+        dup = any(t.get("bid") == x["ID"] or (not t.get("mv") and t["tk"] == tk and t["date"] == date and abs(t["qty"] - qty) < 1e-6) for t in S["tx"])
         known = sorted({t["pie"] for t in S["tx"] if t["tk"] == tk})
         pie = known[0] if len(known) == 1 else ("ETFs" if not known and re.search("ishares|xetra|etf|vanguard|spdr", str(x["Name"]), re.I) else None)
         rows.append({"Importar": not dup, "Pie": pie, "Data": date, "Ativo": tk, "Tipo": "Venda" if "sell" in x["Action"].lower() else "Compra", "Qtd": qty,
@@ -1027,6 +1028,44 @@ with t2:
             if tk and qty > 0 and pr > 0 and fxv > 0:
                 S["tx"].append(dict(id=uuid.uuid4().hex[:8], date=str(d), tk=tk, pie=pie, type=ty, qty=qty, price=pr, cur=cur, fx=fxv)); S["fx"].setdefault(cur, fxv); save(); st.rerun()
             else: st.warning("Preenche ativo, quantidade, preço e câmbio.")
+    def _held():
+        q = {}
+        for t in sorted(S["tx"], key=lambda t: t["date"]): k = (t["pie"], t["tk"]); q[k] = q.get(k, 0.0) + (t["qty"] if t["type"] == "Compra" else -t["qty"])
+        return {k: v for k, v in q.items() if v > 1e-9}
+    def _pie_pos(tk, pie):
+        """Quantidade, custo na moeda da compra e custo em € de um ativo numa pie (custo médio)."""
+        q = cn = ce = 0.0; cur = None
+        for t in sorted(S["tx"], key=lambda t: t["date"]):
+            if t["tk"] != tk or t["pie"] != pie: continue
+            if t["type"] == "Compra": q += t["qty"]; cn += t["qty"] * t["price"]; ce += t["qty"] * t["price"] * t["fx"]
+            else: f = min(1, t["qty"] / q) if q > 0 else 0; cn -= cn * f; ce -= ce * f; q -= t["qty"]
+            cur = t["cur"]
+        return q, cn, ce, cur
+    def _neg(tk, legs):
+        q = {}
+        for t in sorted(S["tx"] + legs, key=lambda t: t["date"]):
+            if t["tk"] != tk: continue
+            q[t["pie"]] = q.get(t["pie"], 0.0) + (t["qty"] if t["type"] == "Compra" else -t["qty"])
+            if q[t["pie"]] < -1e-9: return True
+        return False
+    @st.dialog("🔀 Mover entre pies", width="large")
+    def dlg_mv():
+        H = _held()
+        if not H: st.info("Sem posições abertas."); return
+        tk = st.selectbox("Ativo", sorted({k[1] for k in H}), key="mv_tk")
+        srcs = [p for p in S["pies"] if (p, tk) in H]; src = st.selectbox("Mover da pie", srcs, format_func=lambda p: f"{p} · {num(H[(p, tk)], 6)} em carteira", key=f"mv_src_{tk}")
+        dsts = [p for p in S["pies"] if p != src]
+        if not dsts: st.info("Só tens uma pie; cria outra primeiro."); return
+        dst = st.selectbox("Para a pie", dsts, key=f"mv_dst_{tk}_{src}"); avail = float(H[(src, tk)]); c1, c2 = st.columns(2); d = c1.date_input("Data", key="mv_d")
+        todo = c2.checkbox("Mover tudo", value=True, key=f"mv_all_{tk}_{src}")
+        qty = avail if todo else st.number_input("Quantidade a mover", min_value=0.0, max_value=avail, value=avail / 2, format="%.8f", key=f"mv_q_{tk}_{src}")
+        q0, cn, ce, cur = _pie_pos(tk, src); price = cn / q0 if q0 > 0 else 0.0; fxv = ce / cn if cn else 1.0
+        st.caption(f"Fica {num(avail - qty, 6)} em {src} e {num(qty, 6)} entram em {dst}. Vai com o custo médio da posição ({num(price, 4)} {cur} por unidade, cerca de {num(qty * price * fxv)} € no total). Não conta como compra nem venda: o lucro/prejuízo e o custo mantêm-se.")
+        if st.button("Mover", type="primary", disabled=qty <= 0):
+            base = dict(date=str(d), tk=tk, qty=float(qty), price=float(price), cur=cur, fx=float(fxv), mv=uuid.uuid4().hex[:8])
+            legs = [dict(id=uuid.uuid4().hex[:8], pie=src, type="Venda", **base), dict(id=uuid.uuid4().hex[:8], pie=dst, type="Compra", **base)]
+            if _neg(tk, legs): st.warning("Nessa data a pie de origem não tem essa quantidade (ou ficaria negativa mais tarde).")
+            else: S["tx"].extend(legs); save(); st.rerun()
     @st.dialog("📥 Importar CSV (Trading 212)", width="large")
     def dlg_imp():
         f = st.file_uploader("Ficheiro CSV", type="csv")
@@ -1045,7 +1084,7 @@ with t2:
                     S["fx"].setdefault(r["Moeda"], r["Câmbio €"])
                 if upd:
                     for _, r in dups.iterrows():
-                        t = next((t for t in S["tx"] if t.get("bid") == r["ID"] or (t["tk"] == r["Ativo"] and t["date"] == r["Data"] and abs(t["qty"] - r["Qtd"]) < 1e-6)), None)
+                        t = next((t for t in S["tx"] if t.get("bid") == r["ID"] or (not t.get("mv") and t["tk"] == r["Ativo"] and t["date"] == r["Data"] and abs(t["qty"] - r["Qtd"]) < 1e-6)), None)
                         if t: t.update(fx=r["Câmbio €"], price=r["Preço"], cur=r["Moeda"], bid=r["ID"])
                 save(); st.success("Concluído."); st.rerun()
     with st.expander("💾 Backup e restauro de dados"):
@@ -1082,7 +1121,8 @@ with t2:
     tdf = pd.DataFrame(S["tx"]).sort_values("date", ascending=False); tdf.insert(0, "Apagar", False)
     ed = st.data_editor(tdf.drop(columns=[c for c in ("bid",) if c in tdf]), hide_index=True, disabled=[c for c in tdf.columns if c != "Apagar"], width="stretch")
     if ed["Apagar"].any() and st.button("Apagar selecionadas"):
-        S["tx"] = [t for t in S["tx"] if t["id"] not in set(ed[ed["Apagar"]]["id"])]; save(); st.rerun()
+        ids_ = set(ed[ed["Apagar"]]["id"]); mv_ = {t["mv"] for t in S["tx"] if t["id"] in ids_ and t.get("mv")}  # uma transferência tem duas linhas: apaga as duas
+        S["tx"] = [t for t in S["tx"] if t["id"] not in ids_ and t.get("mv") not in mv_]; save(); st.rerun()
 
 # ================= DESPESAS =================
 with t3:
@@ -1216,7 +1256,7 @@ with t_div:
         else: b.info("Ainda não registaste dividendos recebidos. Importa o CSV de dividendos da Trading 212 ou regista à mão (em baixo).")
         td = dt.date.today(); aport, divd = {}, {}
         for t in S["tx"]:
-            if t["type"] == "Compra" and (pick == "Todas" or t["pie"] == pick):
+            if t["type"] == "Compra" and not t.get("mv") and (pick == "Todas" or t["pie"] == pick):
                 d_ = dt.date.fromisoformat(t["date"]); aport[d_] = aport.get(d_, 0) + t["qty"] * t["price"] * rate_of(t["cur"], t["fx"])
         for x in rec: d_ = dt.date.fromisoformat(x["date"]); divd[d_] = divd.get(d_, 0) + recv(x)
         st.markdown("#### Calendário anual de atividade")
@@ -1432,7 +1472,8 @@ with t_exp:
         st.caption("Ações diretas: setor, indústria e país da empresa e moeda de cotação (Yahoo). ETFs com lista completa (iShares ou ficheiro): cada holding traz setor, país e moeda do próprio ficheiro; a indústria não vem nesses ficheiros, por isso aparece só o setor. ETFs sem lista completa: as maiores posições vêm do Yahoo (ou de um ETF americano equivalente como proxy) e o resto do ETF fica 'não detalhado', a menos que ligues a estimativa. Os setores do ficheiro (GICS) foram convertidos para os nomes do Yahoo, mas as duas classificações não coincidem a 100 %. Ouro (4GLD): tratado como matéria-prima em USD. Não é aconselhamento financeiro.")
 
 with top:
-    b1, b2, b3, b4, b5, b6, _ = st.columns([1.1, 1.3, 0.9, 1.5, 2.0, 1.4, 0.3]); b6.toggle("🌙 Tema escuro", key="dark", on_change=lambda: st.query_params.update({"tema": "escuro" if st.session_state["dark"] else "claro"})); b4.toggle("Pré/pós-mercado", value=True, key="ext_on"); b5.toggle("Custo ao câmbio da compra", value=True, key="cost_hist")
+    b1, b2, b7, b3, b4, b5, b6, _ = st.columns([1.1, 1.3, 1.4, 0.9, 1.5, 2.0, 1.4, 0.2]); b6.toggle("🌙 Tema escuro", key="dark", on_change=lambda: st.query_params.update({"tema": "escuro" if st.session_state["dark"] else "claro"})); b4.toggle("Pré/pós-mercado", value=True, key="ext_on"); b5.toggle("Custo ao câmbio da compra", value=True, key="cost_hist")
     if b1.button("➕ Transação", type="primary", width="stretch"): dlg_add()
     if b2.button("📥 Importar CSV", width="stretch"): dlg_imp()
+    if b7.button("🔀 Mover pie", width="stretch"): dlg_mv()
     if b3.button("🔄 Preços", width="stretch"): st.cache_data.clear(); st.rerun()
