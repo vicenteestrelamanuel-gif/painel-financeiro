@@ -691,6 +691,13 @@ def radar_scores(sub, F, H, LT=None):
 
 LOOK = {"EUNL": "URTH", "QDVE": "XLK", "EUNK": "IEUR", "IS3N": "IEMG", "QUTM": "QTUM"}  # ETFs europeus (UCITS) sem composição no Yahoo: ETF americano equivalente como proxy aproximado
 isetf = lambda tk, f: (f or {}).get("quoteType") in ("ETF", "MUTUALFUND") or tk in LOOK or tk in S.get("etfextra", [])  # ETF = o Yahoo diz que é, está na lista fixa, ou foi marcado à mão
+def _blues(d):
+    """Escala de azuis (como o background_gradient 'Blues') sem depender do matplotlib."""
+    mx = float(np.nanmax(d.values)) if d.size else 0.0; mx = mx or 1.0
+    def c(v):
+        x = min(max(float(v) / mx, 0.0), 1.0) if v == v else 0.0
+        return f"background-color: rgb({int(247 - x * 239)},{int(251 - x * 170)},{int(255 - x * 99)}); color: {'white' if x > 0.6 else 'black'}"
+    return d.apply(lambda col: col.map(c))
 SEC_MAP = {"realestate": "Real Estate", "consumer_cyclical": "Consumer Cyclical", "basic_materials": "Basic Materials", "consumer_defensive": "Consumer Defensive", "technology": "Technology", "communication_services": "Communication Services",
            "financial_services": "Financial Services", "utilities": "Utilities", "industrials": "Industrials", "energy": "Energy", "healthcare": "Healthcare"}
 
@@ -1465,7 +1472,7 @@ with t_exp:
             for p in pies_e:
                 sp = dfa[dfa["Pie"] == p]; Lp, mp = exposure_lines(sp, F, LT); cols_[p] = aggregate(Lp, mp, key, est) / sp["Valor €"].sum() * 100
             Lt_, mt_ = exposure_lines(dfa, F, LT); Cm = pd.DataFrame(cols_).fillna(0.0); Cm["Carteira"] = aggregate(Lt_, mt_, key, est) / dfa["Valor €"].sum() * 100
-            Cm = Cm.fillna(0.0).sort_values("Carteira", ascending=False); st.dataframe(Cm.style.format("{:.1f}%").background_gradient(cmap="Blues", axis=None), width="stretch")
+            Cm = Cm.fillna(0.0).sort_values("Carteira", ascending=False); st.dataframe(Cm.style.format("{:.1f}%").apply(_blues, axis=None), width="stretch")
         with st.expander("Holdings (linhas detalhadas)"):
             D = pd.DataFrame([{"Holding": l["Holding"], "Via": l["Via"], "Valor €": l["v"], "% da seleção": l["v"] / tot * 100 if tot else 0, "Setor": l["sector"], "Indústria": l["industry"], "País": l["country"], "Moeda": l["currency"]} for l in L]).sort_values("Valor €", ascending=False)
             st.dataframe(D.style.format({"Valor €": "{:.2f}", "% da seleção": "{:.2f}"}, na_rep="—"), hide_index=True, width="stretch")
